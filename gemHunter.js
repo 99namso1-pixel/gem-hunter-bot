@@ -21,8 +21,8 @@ const moment = require('moment');
 // ─────────────────────────────────────────────
 const CONFIG = {
     telegram: {
-        botToken:  process.env.TELEGRAM_BOT_TOKEN  || '7676775632:AAF_q1tLIwXc-G-VRvs2lQbKgraJ7GLRbM0',
-        channelId: process.env.TELEGRAM_CHANNEL_ID || '@SolanaHiddenGem',
+        botToken:  process.env.TELEGRAM_BOT_TOKEN  || '8702072641:AAHquqm7NZGlOHyOrEdJ4-skLrVykFGESDc',
+        channelId: process.env.TELEGRAM_CHANNEL_ID || '-4996499184',
     },
 
     scan: {
