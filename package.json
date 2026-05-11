@@ -1,0 +1,14 @@
+{
+  "name": "gem-hunter-v3",
+  "version": "3.0.0",
+  "description": "No-DB multi-chain crypto gem hunter — GMGN + DexScreener",
+  "main": "gemHunter.js",
+  "scripts": {
+    "start": "node gemHunter.js",
+    "dev":   "node --watch gemHunter.js"
+  },
+  "dependencies": {
+    "axios":  "^1.7.8",
+    "moment": "^2.30.1"
+  }
+}
