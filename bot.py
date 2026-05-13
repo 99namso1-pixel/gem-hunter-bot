@@ -1109,66 +1109,69 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── SCHEDULER: scan đúng lúc xx:02 UTC mỗi giờ ──────────
-        # Logic:
-        #   1. Tính số giây đến phút :02 tiếp theo
-        #   2. Sleep đến đúng giờ → scan → gửi Telegram
-        #   3. Lặp lại mỗi giờ
-        SCAN_MINUTE = 2   # Scan lúc xx:02 UTC
+        # ── AUTO SCAN EVERY 1 HOUR ─────────────────────────────
+        # Logic mới:
+        #   1. Scan ngay khi bật bot
+        #   2. Sau đó canh đúng mỗi 3600 giây tính từ lúc BẮT ĐẦU scan trước
+        #   3. Nếu scan quá lâu > 1 giờ thì scan tiếp sau 60 giây, không bị kẹt/miss khung
+        #   4. Gửi Telegram mỗi vòng, kể cả khi không có coin đủ điều kiện
 
-        def seconds_until_next_xx02() -> float:
-            """Trả về số giây đến lần xx:02 UTC kế tiếp."""
-            now = datetime.now(timezone.utc)
-            # Tính phút :02 của giờ hiện tại
-            target = now.replace(minute=SCAN_MINUTE, second=0, microsecond=0)
-            if now >= target:
-                # Đã qua :02 giờ này → đợi đến :02 giờ sau
-                target = target.replace(hour=(target.hour + 1) % 24)
-                if target.hour == 0 and now.hour == 23:
-                    # Qua nửa đêm UTC
-                    from datetime import timedelta
-                    target = target + timedelta(days=1)
-            diff = (target - now).total_seconds()
-            return max(diff, 0)
+        import os
+        from datetime import timedelta
 
-        log.info("⏰ SCHEDULER khởi động — scan lúc xx:02 UTC mỗi giờ")
+        RUN_IMMEDIATELY_ON_START = True
+        FIXED_SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", AUTO_SCAN_INTERVAL_SECONDS))
+        MIN_SLEEP_AFTER_LONG_SCAN = 60
+
+        log.info("⏰ AUTO SCAN khởi động — gửi Telegram mỗi 1 giờ")
         log.info("   Chạy '--now' để test 1 lần rồi thoát")
         log.info("   Test 1 coin: python bot.py --test-one SOLUSDT Binance")
-        log.info("   Test 1 coin: python bot.py --test-one PEAQUSDT BingX")
+        log.info("   Có thể đổi chu kỳ bằng env SCAN_INTERVAL_SECONDS=3600")
+
+        next_scan_at = time.time() if RUN_IMMEDIATELY_ON_START else time.time() + FIXED_SCAN_INTERVAL_SECONDS
 
         while True:
-            now_utc = datetime.now(timezone.utc)
+            now_ts = time.time()
 
-            # Nếu đang gần :02 (trong vòng 30s) → scan ngay
-            # Ngược lại → sleep đến :02
-            wait = seconds_until_next_xx02()
-
-            if wait > 30:
-                next_scan = datetime.now(timezone.utc).replace(
-                    minute=SCAN_MINUTE, second=0, microsecond=0
-                )
-                if datetime.now(timezone.utc).minute >= SCAN_MINUTE:
-                    from datetime import timedelta
-                    next_scan += timedelta(hours=1)
+            if now_ts < next_scan_at:
+                wait = next_scan_at - now_ts
+                next_dt = datetime.fromtimestamp(next_scan_at, tz=timezone.utc)
                 log.info(
                     f"⏳ Đợi {wait/60:.1f} phút đến "
-                    f"{next_scan.strftime('%H:%M UTC')} để scan..."
+                    f"{next_dt.strftime('%Y-%m-%d %H:%M UTC')} để scan..."
                 )
-                time.sleep(min(wait, 30))   # Kiểm tra lại mỗi 30s
+                time.sleep(min(wait, 60))
                 continue
 
-            # Đến giờ rồi → sleep nốt rồi scan
-            if wait > 0:
-                log.info(f"⏳ Còn {wait:.0f}s đến xx:02 UTC...")
-                time.sleep(wait)
-
-            # SCAN
-            hhmm = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            scan_start_ts = time.time()
+            hhmm = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             log.info(f"🚀 [{hhmm}] Bắt đầu scan...")
-            scan_start = time.time()
-            job()
-            elapsed = time.time() - scan_start
-            log.info(f"✅ Scan xong trong {elapsed:.0f}s — đợi đến giờ :02 tiếp theo")
 
-            # Sleep qua phút :02 hiện tại (tránh scan 2 lần trong cùng 1 phút)
-            time.sleep(90)
+            try:
+                job()
+            except Exception as e:
+                log.error(f"Main loop error: {e}", exc_info=True)
+                try:
+                    send_telegram(f"❌ Scanner main loop error: {html.escape(str(e))}")
+                except Exception:
+                    pass
+
+            elapsed = time.time() - scan_start_ts
+
+            # Lần kế tiếp = đúng 1 giờ sau thời điểm BẮT ĐẦU scan vòng hiện tại.
+            # Nếu scan quá lâu và đã quá giờ kế tiếp, tránh chạy dồn liên tục bằng cách nghỉ tối thiểu 60s.
+            planned_next = scan_start_ts + FIXED_SCAN_INTERVAL_SECONDS
+            if time.time() >= planned_next:
+                next_scan_at = time.time() + MIN_SLEEP_AFTER_LONG_SCAN
+                log.warning(
+                    f"⚠️ Scan mất {elapsed/60:.1f} phút, dài hơn chu kỳ. "
+                    f"Sẽ scan tiếp sau {MIN_SLEEP_AFTER_LONG_SCAN}s."
+                )
+            else:
+                next_scan_at = planned_next
+
+            next_dt = datetime.fromtimestamp(next_scan_at, tz=timezone.utc)
+            log.info(
+                f"✅ Scan xong trong {elapsed:.0f}s — lần tiếp theo: "
+                f"{next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+            )
