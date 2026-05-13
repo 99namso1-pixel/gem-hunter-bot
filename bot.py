@@ -1102,17 +1102,66 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        log.info("⏰ AUTO LOOP bắt đầu — scan ngay, sau đó mỗi 1 giờ")
+        # ── SCHEDULER: scan đúng lúc xx:02 UTC mỗi giờ ──────────
+        # Logic:
+        #   1. Tính số giây đến phút :02 tiếp theo
+        #   2. Sleep đến đúng giờ → scan → gửi Telegram
+        #   3. Lặp lại mỗi giờ
+        SCAN_MINUTE = 2   # Scan lúc xx:02 UTC
+
+        def seconds_until_next_xx02() -> float:
+            """Trả về số giây đến lần xx:02 UTC kế tiếp."""
+            now = datetime.now(timezone.utc)
+            # Tính phút :02 của giờ hiện tại
+            target = now.replace(minute=SCAN_MINUTE, second=0, microsecond=0)
+            if now >= target:
+                # Đã qua :02 giờ này → đợi đến :02 giờ sau
+                target = target.replace(hour=(target.hour + 1) % 24)
+                if target.hour == 0 and now.hour == 23:
+                    # Qua nửa đêm UTC
+                    from datetime import timedelta
+                    target = target + timedelta(days=1)
+            diff = (target - now).total_seconds()
+            return max(diff, 0)
+
+        log.info("⏰ SCHEDULER khởi động — scan lúc xx:02 UTC mỗi giờ")
         log.info("   Chạy '--now' để test 1 lần rồi thoát")
         log.info("   Test 1 coin: python bot.py --test-one SOLUSDT Binance")
-        log.info("   Test 1 coin: python bot.py --test-one SOLAYERUSDT Bybit")
+        log.info("   Test 1 coin: python bot.py --test-one PEAQUSDT BingX")
 
         while True:
-            started = datetime.now(timezone.utc)
-            log.info("🚀 Auto scan cycle started")
-            job()
+            now_utc = datetime.now(timezone.utc)
 
-            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-            sleep_seconds = max(60, AUTO_SCAN_INTERVAL_SECONDS - int(elapsed))
-            log.info(f"😴 Scan xong. Nghỉ {sleep_seconds}s rồi scan tiếp...")
-            time.sleep(sleep_seconds)
+            # Nếu đang gần :02 (trong vòng 30s) → scan ngay
+            # Ngược lại → sleep đến :02
+            wait = seconds_until_next_xx02()
+
+            if wait > 30:
+                next_scan = datetime.now(timezone.utc).replace(
+                    minute=SCAN_MINUTE, second=0, microsecond=0
+                )
+                if datetime.now(timezone.utc).minute >= SCAN_MINUTE:
+                    from datetime import timedelta
+                    next_scan += timedelta(hours=1)
+                log.info(
+                    f"⏳ Đợi {wait/60:.1f} phút đến "
+                    f"{next_scan.strftime('%H:%M UTC')} để scan..."
+                )
+                time.sleep(min(wait, 30))   # Kiểm tra lại mỗi 30s
+                continue
+
+            # Đến giờ rồi → sleep nốt rồi scan
+            if wait > 0:
+                log.info(f"⏳ Còn {wait:.0f}s đến xx:02 UTC...")
+                time.sleep(wait)
+
+            # SCAN
+            hhmm = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            log.info(f"🚀 [{hhmm}] Bắt đầu scan...")
+            scan_start = time.time()
+            job()
+            elapsed = time.time() - scan_start
+            log.info(f"✅ Scan xong trong {elapsed:.0f}s — đợi đến giờ :02 tiếp theo")
+
+            # Sleep qua phút :02 hiện tại (tránh scan 2 lần trong cùng 1 phút)
+            time.sleep(90)
