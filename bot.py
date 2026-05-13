@@ -27,7 +27,7 @@ from config import (
 )
 
 # Có thể sửa nhanh tại đây
-SCAN_EXCHANGES = ["Binance", "Bybit"]  # ["Binance"], ["Bybit"], hoặc cả 2
+SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Thêm BingX
 PER_EXCHANGE_TOP_N = False             # True = lấy top mỗi sàn, False = gộp chung top
 TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
@@ -43,7 +43,8 @@ HYBRID_MIN_SCORE = 5.0                  # Cả trend + squeeze đều mạnh
 # Tăng tốc scan
 FAST_SCAN = True
 MAX_WORKERS_BINANCE = 12   # Nếu bị rate-limit thì giảm còn 6-8
-MAX_WORKERS_BYBIT = 10     # Nếu bị rate-limit thì giảm còn 5-8
+MAX_WORKERS_BYBIT  = 10    # Nếu bị rate-limit thì giảm còn 5-8
+MAX_WORKERS_BINGX  = 8     # BingX rate limit thấp hơn
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
 
 # ── Logging ──────────────────────────────────────────────────
@@ -60,7 +61,8 @@ log = logging.getLogger(__name__)
 # ── API Base ─────────────────────────────────────────────────
 COINGLASS_BASE = "https://open-api-v3.coinglass.com/api"
 BINANCE_BASE = "https://fapi.binance.com"
-BYBIT_BASE = "https://api.bybit.com"
+BYBIT_BASE  = "https://api.bybit.com"
+BINGX_BASE  = "https://open-api.bingx.com"
 
 CG_HEADERS = {
     "accept": "application/json",
@@ -166,6 +168,18 @@ def cg_get(endpoint: str, params: dict | None = None) -> Optional[Any]:
     return None
 
 
+
+def bingx_get(endpoint: str, params: dict | None = None) -> Optional[dict]:
+    """BingX public API helper."""
+    data = http_get(f"{BINGX_BASE}{endpoint}", params=params or {})
+    if not data:
+        return None
+    code = data.get("code", -1)
+    if code == 0:
+        return data.get("data", {})
+    log.warning(f"BingX API error {endpoint}: code={code} msg={data.get('msg','')}")
+    return None
+
 def bybit_get(endpoint: str, params: dict | None = None) -> Optional[dict]:
     data = http_get(f"{BYBIT_BASE}{endpoint}", params=params or {})
     if not data:
@@ -239,11 +253,28 @@ def get_bybit_symbols() -> list[str]:
     return sorted(set(symbols))
 
 
+
+def get_bingx_symbols() -> list[str]:
+    log.info("Fetching BingX USDT Perp symbols...")
+    data = http_get(f"{BINGX_BASE}/openApi/swap/v2/quote/contracts")
+    if not data:
+        return []
+    items = data.get("data", []) if isinstance(data, dict) else []
+    symbols = []
+    for item in items:
+        symbol = item.get("symbol", "").replace("-", "")  # BTC-USDT → BTCUSDT
+        if symbol.endswith("USDT") and symbol not in EXCLUDE_SYMBOLS:
+            symbols.append(symbol)
+    log.info(f"Found {len(symbols)} BingX symbols")
+    return sorted(set(symbols))
+
 def get_all_symbols(exchange: str) -> list[str]:
     if exchange == "Binance":
         return get_binance_symbols()
     if exchange == "Bybit":
         return get_bybit_symbols()
+    if exchange == "BingX":
+        return get_bingx_symbols()
     raise ValueError(f"Unsupported exchange: {exchange}")
 
 
@@ -301,11 +332,42 @@ def get_bybit_ohlcv(symbol: str, limit: int = 25) -> Optional[list]:
     return candles
 
 
+
+def get_bingx_ohlcv(symbol: str, limit: int = 25) -> Optional[list]:
+    """BingX OHLCV — symbol format: BTCUSDT → BTC-USDT cho API."""
+    api_symbol = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else symbol
+    data = http_get(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", {
+        "symbol": api_symbol,
+        "interval": "1d",
+        "limit": limit,
+    })
+    if not data:
+        return None
+    rows = data.get("data", []) if isinstance(data, dict) else data
+    if not rows or not isinstance(rows, list):
+        return None
+    candles = []
+    for row in rows:
+        try:
+            candles.append({
+                "t": int(row.get("time", row[0] if isinstance(row, list) else 0)),
+                "o": float(row.get("open",  row[1] if isinstance(row, list) else 0)),
+                "h": float(row.get("high",  row[2] if isinstance(row, list) else 0)),
+                "l": float(row.get("low",   row[3] if isinstance(row, list) else 0)),
+                "c": float(row.get("close", row[4] if isinstance(row, list) else 0)),
+                "v": float(row.get("volume",row[5] if isinstance(row, list) else 0)),
+            })
+        except Exception:
+            continue
+    return candles if candles else None
+
 def get_ohlcv(exchange: str, symbol: str, limit: int = 25) -> Optional[list]:
     if exchange == "Binance":
         return get_binance_ohlcv(symbol, limit)
     if exchange == "Bybit":
         return get_bybit_ohlcv(symbol, limit)
+    if exchange == "BingX":
+        return get_bingx_ohlcv(symbol, limit)
     return None
 
 
@@ -355,6 +417,15 @@ def get_funding_rate(exchange: str, symbol: str) -> Optional[float]:
         if rows and "fundingRate" in rows[0]:
             return float(rows[0]["fundingRate"])
 
+    elif exchange == "BingX":
+        api_symbol = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else symbol
+        d = http_get_quick(f"{BINGX_BASE}/openApi/swap/v2/quote/premiumIndex",
+                           {"symbol": api_symbol})
+        if d and isinstance(d, dict):
+            rows = d.get("data", {})
+            if isinstance(rows, dict) and "lastFundingRate" in rows:
+                return float(rows["lastFundingRate"])
+
     return None
 
 
@@ -386,6 +457,18 @@ def get_oi_history(exchange: str, symbol: str, limit: int = 6) -> Optional[list]
             rows = list(reversed(rows))
             return [{"openInterest": float(x.get("openInterest", 0))} for x in rows]
 
+    elif exchange == "BingX":
+        api_symbol = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else symbol
+        d = http_get_quick(f"{BINGX_BASE}/openApi/swap/v2/quote/openInterestHist", {
+            "symbol": api_symbol,
+            "period": "1d",
+            "limit": limit,
+        })
+        if d and isinstance(d, dict):
+            rows = d.get("data", [])
+            if isinstance(rows, list) and rows:
+                return [{"openInterest": float(x.get("openInterest", 0))} for x in rows]
+
     return None
 
 
@@ -410,6 +493,7 @@ def get_lsr(exchange: str, symbol: str) -> Optional[float]:
     if data and isinstance(data, list) and len(data) > 0:
         return float(data[0].get("longShortRatio", 0))
 
+    # BingX: không có LSR public endpoint → trả None
     return None
 
 
@@ -751,7 +835,7 @@ def run_scan_exchange(exchange: str) -> list[ScoreResult]:
 
     results: list[ScoreResult] = []
     errors = 0
-    workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BYBIT
+    workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BINGX if exchange == "BingX" else MAX_WORKERS_BYBIT
 
     log.info(f"🚀 {exchange}: scanning {len(symbols)} symbols với {workers} workers...")
 
