@@ -1,0 +1,86 @@
+[
+  {
+    "exchange": "Binance",
+    "symbol": "IRYSUSDT",
+    "score": 8.0,
+    "signal_type": "🚀📡 MOMENTUM+OI",
+    "vol_ratio": 3.25,
+    "oi_chg_pct": 63.5,
+    "fr": 0.005,
+    "lsr": 1.2247,
+    "liq_ratio": 0,
+    "price_chg": 16.51,
+    "details": [
+      "🚀 Momentum (+16.5%)",
+      "📊 Vol Spike (3.2x)",
+      "📡 OI Div cực mạnh (+63.5%)",
+      "💰 FR thấp (0.0050%)",
+      "📈 L/S healthy 1.2247 ✅"
+    ],
+    "scores": {
+      "momentum": 2.0,
+      "cvb": 1.0,
+      "oi_div": 3.0,
+      "fr": 1.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  },
+  {
+    "exchange": "Bybit",
+    "symbol": "PEAQUSDT",
+    "score": 7.0,
+    "signal_type": "💥🌋 SQUEEZE+BURST",
+    "vol_ratio": 2.32,
+    "oi_chg_pct": 53.1,
+    "fr": -0.8055,
+    "lsr": 0,
+    "liq_ratio": 0,
+    "price_chg": 9.59,
+    "details": [
+      "📈 Giá tăng (+9.6%)",
+      "📊 Vol Spike (2.3x)",
+      "📡 OI Div cực mạnh (+53.1%)",
+      "💥 FR âm sâu (-0.806%)"
+    ],
+    "scores": {
+      "momentum": 1.0,
+      "cvb": 1.0,
+      "oi_div": 3.0,
+      "fr": 1.5,
+      "lsr": 0,
+      "liq": 0,
+      "squeeze": 0.5
+    }
+  },
+  {
+    "exchange": "Binance",
+    "symbol": "COSUSDT",
+    "score": 6.0,
+    "signal_type": "💥🌋 SQUEEZE+BURST",
+    "vol_ratio": 6.27,
+    "oi_chg_pct": 7.0,
+    "fr": -0.7299,
+    "lsr": 2.8865,
+    "liq_ratio": 0,
+    "price_chg": 19.51,
+    "details": [
+      "🚀 Momentum (+19.5%)",
+      "📊 Vol Spike (6.3x)",
+      "📡 OI tăng (+7.0%)",
+      "💥 FR âm sâu (-0.730%)",
+      "⚠️ L/S crowded 2.8865",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "momentum": 2.0,
+      "cvb": 1.0,
+      "oi_div": 1.0,
+      "fr": 1.5,
+      "lsr": -0.5,
+      "liq": 0,
+      "squeeze": 0.5
+    }
+  }
+]

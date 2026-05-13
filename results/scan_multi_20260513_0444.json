@@ -1,0 +1,100 @@
+[
+  {
+    "exchange": "Binance",
+    "symbol": "IRYSUSDT",
+    "score": 8.9,
+    "signal_type": "🟢 TREND ENGINE",
+    "vol_ratio": 3.57,
+    "oi_chg_pct": 63.5,
+    "fr": 0.005,
+    "lsr": 1.2247,
+    "liq_ratio": 0,
+    "price_chg": 17.61,
+    "market_mode": "TREND",
+    "trend_score": 7.5,
+    "squeeze_engine_score": 3.2,
+    "details": [
+      "🟢 TREND engine 7.5",
+      "🚀 Momentum (+17.6%)",
+      "📊 Vol Spike (3.6x)",
+      "📡 OI Div cực mạnh (+63.5%)",
+      "💰 FR thấp (0.0050%)",
+      "📈 L/S healthy 1.2247 ✅",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "momentum": 2.0,
+      "cvb": 1.0,
+      "oi_div": 3.0,
+      "fr": 1.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  },
+  {
+    "exchange": "Binance",
+    "symbol": "COSUSDT",
+    "score": 7.5,
+    "signal_type": "🔴 SQUEEZE ENGINE",
+    "vol_ratio": 8.51,
+    "oi_chg_pct": 7.0,
+    "fr": -0.8067,
+    "lsr": 2.8865,
+    "liq_ratio": 0,
+    "price_chg": 32.82,
+    "market_mode": "SQUEEZE",
+    "trend_score": 4.5,
+    "squeeze_engine_score": 9.5,
+    "details": [
+      "🔴 SQUEEZE engine 9.5",
+      "🚀 Momentum mạnh (+32.8%)",
+      "📊 Vol Spike (8.5x)",
+      "📡 OI tăng (+7.0%)",
+      "💥 FR âm sâu (-0.807%)",
+      "⚠️ L/S crowded 2.8865",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "momentum": 3.0,
+      "cvb": 1.0,
+      "oi_div": 1.0,
+      "fr": 1.5,
+      "lsr": -0.5,
+      "liq": 0,
+      "squeeze": 0.5
+    }
+  },
+  {
+    "exchange": "Bybit",
+    "symbol": "IRYSUSDT",
+    "score": 6.9,
+    "signal_type": "🟢 TREND ENGINE",
+    "vol_ratio": 2.66,
+    "oi_chg_pct": 30.6,
+    "fr": 0.005,
+    "lsr": 0,
+    "liq_ratio": 0,
+    "price_chg": 17.9,
+    "market_mode": "TREND",
+    "trend_score": 5.0,
+    "squeeze_engine_score": 3.2,
+    "details": [
+      "🟢 TREND engine 5.0",
+      "🚀 Momentum (+17.9%)",
+      "📊 Vol Spike (2.7x)",
+      "📡 OI Div mạnh (+30.6%)",
+      "💰 FR thấp (0.0050%)",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "momentum": 2.0,
+      "cvb": 1.0,
+      "oi_div": 2.0,
+      "fr": 1.0,
+      "lsr": 0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  }
+]

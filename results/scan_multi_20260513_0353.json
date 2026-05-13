@@ -1,0 +1,133 @@
+[
+  {
+    "exchange": "Binance",
+    "symbol": "COSUSDT",
+    "score": 6.5,
+    "signal_type": "💥🌋 SQUEEZE+BURST",
+    "vol_ratio": 4.51,
+    "oi_chg_pct": 7.0,
+    "fr": -0.7582,
+    "lsr": 2.8865,
+    "liq_ratio": 0,
+    "price_chg": 19.1,
+    "details": [
+      "📊 Vol Spike (4.5x)",
+      "📡 OI tăng (+7.0%)",
+      "💥 FR âm sâu (-0.758%)",
+      "📈 L/S 2.8865 ✅",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "cvb": 1.0,
+      "oi_div": 1.0,
+      "fr": 2.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 1.0
+    }
+  },
+  {
+    "exchange": "Binance",
+    "symbol": "IRYSUSDT",
+    "score": 6.5,
+    "signal_type": "📡 OI DIVERGENCE",
+    "vol_ratio": 2.51,
+    "oi_chg_pct": 63.5,
+    "fr": 0.005,
+    "lsr": 1.2247,
+    "liq_ratio": 0,
+    "price_chg": 18.4,
+    "details": [
+      "📊 Vol Spike (2.5x)",
+      "📡 OI Div mạnh (+63.5%)",
+      "💰 FR thấp (0.0050%)",
+      "📈 L/S 1.2247 ✅",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "cvb": 1.0,
+      "oi_div": 2.0,
+      "fr": 2.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  },
+  {
+    "exchange": "Binance",
+    "symbol": "VICUSDT",
+    "score": 6.0,
+    "signal_type": "📡 OI DIVERGENCE",
+    "vol_ratio": 2.94,
+    "oi_chg_pct": 144.0,
+    "fr": -0.0048,
+    "lsr": 1.8043,
+    "liq_ratio": 0,
+    "price_chg": 1.25,
+    "details": [
+      "📊 Vol Spike (2.9x)",
+      "📡 OI Div mạnh (+144.0%)",
+      "💰 FR thấp (-0.0048%)",
+      "📈 L/S 1.8043 ✅"
+    ],
+    "scores": {
+      "cvb": 1.0,
+      "oi_div": 2.0,
+      "fr": 2.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  },
+  {
+    "exchange": "Bybit",
+    "symbol": "PEAQUSDT",
+    "score": 6.0,
+    "signal_type": "💥🌋 SQUEEZE+BURST",
+    "vol_ratio": 2.07,
+    "oi_chg_pct": 53.1,
+    "fr": -0.7945,
+    "lsr": 0,
+    "liq_ratio": 0,
+    "price_chg": 6.14,
+    "details": [
+      "📊 Vol Spike (2.1x)",
+      "📡 OI Div mạnh (+53.1%)",
+      "💥 FR âm sâu (-0.795%)"
+    ],
+    "scores": {
+      "cvb": 1.0,
+      "oi_div": 2.0,
+      "fr": 2.0,
+      "lsr": 0,
+      "liq": 0,
+      "squeeze": 1.0
+    }
+  },
+  {
+    "exchange": "Binance",
+    "symbol": "1000000MOGUSDT",
+    "score": 5.5,
+    "signal_type": "📡 OI DIVERGENCE",
+    "vol_ratio": 0.06,
+    "oi_chg_pct": 8.2,
+    "fr": 0.005,
+    "lsr": 2.888,
+    "liq_ratio": 0,
+    "price_chg": 2.66,
+    "details": [
+      "📡 OI Div mạnh (+8.2%)",
+      "💰 FR thấp (0.0050%)",
+      "📈 L/S 2.8880 ✅",
+      "✅ Nến đẹp"
+    ],
+    "scores": {
+      "cvb": 0,
+      "oi_div": 2.0,
+      "fr": 2.0,
+      "lsr": 1.0,
+      "liq": 0,
+      "squeeze": 0
+    }
+  }
+]
