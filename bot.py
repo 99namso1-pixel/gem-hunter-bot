@@ -133,6 +133,8 @@ class ScoreResult:
     lsr: float = 0
     liq_ratio: float = 0
     price_chg: float = 0
+    price_current: float = 0    # Giá hiện tại (close nến gần nhất)
+    day_low: float = 0          # Giá thấp nhất trong ngày
     details: list = field(default_factory=list)
 
     @property
@@ -679,7 +681,9 @@ def score_coin(coin: CoinData) -> Optional[ScoreResult]:
     result.fr = round(coin.funding_rate * 100, 4)
     result.lsr = round(coin.lsr, 4)
     result.liq_ratio = round(coin.liq_ratio, 2)
-    result.price_chg = round(coin.price_change_pct, 2)
+    result.price_chg    = round(coin.price_change_pct, 2)
+    result.price_current = round(coin.close, 8)
+    result.day_low       = round(coin.low,   8)
 
     # Filter noise: bỏ coin tăng yếu + volume yếu để tránh lọt top kiểu 1INCH/MOG vol thấp
     if vol_ratio < MIN_VOL_RATIO_FILTER and coin.price_change_pct < MIN_PRICE_CHANGE_FILTER:
@@ -977,9 +981,10 @@ def format_alert(results: list[ScoreResult]) -> str:
             f"{badge} <b>{rank_name}</b>\n"
             f"<b>{symbol}</b> — {exchange} — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
             f"{mode_icon} <b>{signal}</b>\n"
+            f"💰 Giá: <b>{r.price_current:.6g}</b> | Low ngày: {r.day_low:.6g} | +{r.price_chg:.2f}%\n"
             f"Vol: {r.vol_ratio}x | OI: {r.oi_chg_pct:+.1f}% | "
             f"FR: {r.fr:.4f}% | L/S: {r.lsr:.3f}\n"
-            f"Liq: {r.liq_ratio:.1f}x | Giá: {r.price_chg:+.2f}%"
+            f"Liq: {r.liq_ratio:.1f}x"
         )
         if details:
             lines.append(f"<i>{details}</i>")
@@ -1008,6 +1013,8 @@ def save_results(results: list[ScoreResult]) -> str:
             "lsr": r.lsr,
             "liq_ratio": r.liq_ratio,
             "price_chg": r.price_chg,
+            "price_current": r.price_current,
+            "day_low": r.day_low,
             "market_mode": r.market_mode,
             "trend_score": r.trend_score,
             "squeeze_engine_score": r.squeeze_engine_score,
