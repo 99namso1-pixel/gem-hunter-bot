@@ -27,8 +27,8 @@ from config import (
 )
 
 # Có thể sửa nhanh tại đây
-SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Thêm BingX
-PER_EXCHANGE_TOP_N = False             # True = lấy top mỗi sàn, False = gộp chung top
+SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Quét cả 3 sàn
+PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
 MIN_VOL_RATIO_FILTER = 2.0              # Tăng 1.2→2.0: loại noise MOG/1INCH vol thấp
@@ -883,6 +883,15 @@ def run_scan_exchange(exchange: str) -> list[ScoreResult]:
     return results
 
 def run_scan() -> list[ScoreResult]:
+    """
+    Quét cả 3 sàn trong SCAN_EXCHANGES, gộp kết quả lại,
+    bỏ coin trùng symbol giữa các sàn bằng cách giữ bản có điểm cao nhất.
+
+    Quy tắc xếp hạng:
+    1) Nếu có SQUEEZE/HYBRID đủ mạnh → ưu tiên 1 coin SQUEEZE mạnh nhất lên TOP 1.
+    2) Các vị trí còn lại xếp theo total_score cao → thấp.
+    3) Nếu không có SQUEEZE → TOP 1/2/3 theo total_score bình thường.
+    """
     all_results: list[ScoreResult] = []
 
     for exchange in SCAN_EXCHANGES:
@@ -892,27 +901,37 @@ def run_scan() -> list[ScoreResult]:
         else:
             all_results.extend(ex_results)
 
-    # Dedup: giữ score cao nhất mỗi coin (tránh IRYS Binance + IRYS Bybit trùng nhau)
+    # Dedup: cùng 1 coin xuất hiện ở nhiều sàn thì giữ bản có total_score cao nhất
     seen_coins: dict[str, ScoreResult] = {}
     for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
         base = r.symbol.upper()
         if base not in seen_coins:
             seen_coins[base] = r
+
     unique = list(seen_coins.values())
+    if not unique:
+        return []
 
-    # Tách SQUEEZE và TREND/MOMENTUM
-    squeezes = [r for r in unique if r.market_mode == "SQUEEZE" or r.squeeze_engine_score >= SQUEEZE_MIN_SCORE]
-    others   = [r for r in unique if r not in squeezes]
+    # Nhóm SQUEEZE/HYBRID đủ mạnh để ưu tiên TOP 1
+    squeezes = [
+        r for r in unique
+        if r.market_mode in ("SQUEEZE", "HYBRID") or r.squeeze_engine_score >= SQUEEZE_MIN_SCORE
+    ]
 
-    # Sắp xếp từng nhóm theo điểm
-    squeezes.sort(key=lambda x: x.squeeze_engine_score, reverse=True)
-    others.sort(key=lambda x: x.total_score, reverse=True)
+    # SQUEEZE mạnh nhất: ưu tiên squeeze_engine_score, sau đó total_score
+    squeezes.sort(key=lambda x: (x.squeeze_engine_score, x.total_score), reverse=True)
 
-    # Ưu tiên: SQUEEZE lên #1 nếu có, rồi ghép với phần còn lại
+    # Còn lại xếp theo điểm tổng cao xuống thấp
+    final: list[ScoreResult] = []
     if squeezes:
-        final = [squeezes[0]] + others[:TOP_N_FINAL - 1]
+        top_squeeze = squeezes[0]
+        final.append(top_squeeze)
+        remaining = [r for r in unique if r.symbol.upper() != top_squeeze.symbol.upper()]
     else:
-        final = others[:TOP_N_FINAL]
+        remaining = unique
+
+    remaining.sort(key=lambda x: x.total_score, reverse=True)
+    final.extend(remaining)
 
     return final[:TOP_N_FINAL]
 
@@ -1109,69 +1128,71 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── AUTO SCAN EVERY 1 HOUR ─────────────────────────────
-        # Logic mới:
-        #   1. Scan ngay khi bật bot
-        #   2. Sau đó canh đúng mỗi 3600 giây tính từ lúc BẮT ĐẦU scan trước
-        #   3. Nếu scan quá lâu > 1 giờ thì scan tiếp sau 60 giây, không bị kẹt/miss khung
-        #   4. Gửi Telegram mỗi vòng, kể cả khi không có coin đủ điều kiện
+        # ── SCHEDULER: scan đúng lúc xx:02 UTC mỗi giờ ──────────
+        # Logic:
+        #   1. Bot KHÔNG scan ngay khi bật, mà chờ đúng phút :02 UTC kế tiếp
+        #   2. Đến xx:02 UTC → bắt đầu scan
+        #   3. job() scan xong sẽ tự gửi Telegram alert
+        #   4. Sau khi scan xong, tiếp tục chờ tới xx:02 UTC kế tiếp
+        #   5. Nếu scan kéo dài qua mốc xx:02 kế tiếp, bot sẽ bỏ mốc đã lỡ
+        #      và chờ tới xx:02 của giờ kế tiếp nữa để tránh chạy chồng scan
 
-        import os
         from datetime import timedelta
 
-        RUN_IMMEDIATELY_ON_START = True
-        FIXED_SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", AUTO_SCAN_INTERVAL_SECONDS))
-        MIN_SLEEP_AFTER_LONG_SCAN = 60
+        SCAN_MINUTE = 2       # scan lúc xx:02 UTC
+        CHECK_SLEEP = 30      # khi còn lâu, kiểm tra lại mỗi 30 giây
 
-        log.info("⏰ AUTO SCAN khởi động — gửi Telegram mỗi 1 giờ")
+        def next_scan_time_utc(now: datetime | None = None) -> datetime:
+            """Trả về thời điểm xx:02 UTC kế tiếp sau hiện tại."""
+            now = now or datetime.now(timezone.utc)
+            target = now.replace(minute=SCAN_MINUTE, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(hours=1)
+            return target
+
+        log.info("⏰ SCHEDULER khởi động — scan đúng lúc xx:02 UTC mỗi giờ")
+        log.info("   Scan xong sẽ gửi Telegram alert ngay")
         log.info("   Chạy '--now' để test 1 lần rồi thoát")
         log.info("   Test 1 coin: python bot.py --test-one SOLUSDT Binance")
-        log.info("   Có thể đổi chu kỳ bằng env SCAN_INTERVAL_SECONDS=3600")
-
-        next_scan_at = time.time() if RUN_IMMEDIATELY_ON_START else time.time() + FIXED_SCAN_INTERVAL_SECONDS
+        log.info("   Test 1 coin: python bot.py --test-one PEAQUSDT BingX")
 
         while True:
-            now_ts = time.time()
+            target = next_scan_time_utc()
 
-            if now_ts < next_scan_at:
-                wait = next_scan_at - now_ts
-                next_dt = datetime.fromtimestamp(next_scan_at, tz=timezone.utc)
+            # Chờ tới đúng xx:02 UTC
+            while True:
+                now = datetime.now(timezone.utc)
+                wait = (target - now).total_seconds()
+
+                if wait <= 0:
+                    break
+
                 log.info(
                     f"⏳ Đợi {wait/60:.1f} phút đến "
-                    f"{next_dt.strftime('%Y-%m-%d %H:%M UTC')} để scan..."
+                    f"{target.strftime('%Y-%m-%d %H:%M UTC')} để scan..."
                 )
-                time.sleep(min(wait, 60))
-                continue
+                time.sleep(min(wait, CHECK_SLEEP))
 
-            scan_start_ts = time.time()
-            hhmm = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            log.info(f"🚀 [{hhmm}] Bắt đầu scan...")
+            # Đến đúng lịch → scan. Telegram sẽ được gửi bên trong job() sau khi scan xong.
+            scan_start_dt = datetime.now(timezone.utc)
+            log.info(f"🚀 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Bắt đầu scan...")
+            scan_start = time.time()
 
             try:
                 job()
             except Exception as e:
-                log.error(f"Main loop error: {e}", exc_info=True)
+                log.error(f"Main scheduler error: {e}", exc_info=True)
                 try:
-                    send_telegram(f"❌ Scanner main loop error: {html.escape(str(e))}")
+                    send_telegram(f"❌ Scanner scheduler error: {html.escape(str(e))}")
                 except Exception:
                     pass
 
-            elapsed = time.time() - scan_start_ts
+            elapsed = time.time() - scan_start
+            finished_dt = datetime.now(timezone.utc)
+            next_target = next_scan_time_utc(finished_dt)
 
-            # Lần kế tiếp = đúng 1 giờ sau thời điểm BẮT ĐẦU scan vòng hiện tại.
-            # Nếu scan quá lâu và đã quá giờ kế tiếp, tránh chạy dồn liên tục bằng cách nghỉ tối thiểu 60s.
-            planned_next = scan_start_ts + FIXED_SCAN_INTERVAL_SECONDS
-            if time.time() >= planned_next:
-                next_scan_at = time.time() + MIN_SLEEP_AFTER_LONG_SCAN
-                log.warning(
-                    f"⚠️ Scan mất {elapsed/60:.1f} phút, dài hơn chu kỳ. "
-                    f"Sẽ scan tiếp sau {MIN_SLEEP_AFTER_LONG_SCAN}s."
-                )
-            else:
-                next_scan_at = planned_next
-
-            next_dt = datetime.fromtimestamp(next_scan_at, tz=timezone.utc)
             log.info(
-                f"✅ Scan xong trong {elapsed:.0f}s — lần tiếp theo: "
-                f"{next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+                f"✅ Scan xong trong {elapsed:.0f}s lúc "
+                f"{finished_dt.strftime('%Y-%m-%d %H:%M UTC')} — "
+                f"lần tiếp theo: {next_target.strftime('%Y-%m-%d %H:%M UTC')}"
             )
