@@ -142,6 +142,16 @@ class CoinData:
     h1_vol_ma10: float = 0
     h1_price_change_pct: float = 0
     h1_available: bool = False         # True nếu lấy được 1H data
+    # M30 data — xác nhận momentum cho reversal scan 30 phút
+    m30_open: float = 0
+    m30_close: float = 0
+    m30_high: float = 0
+    m30_low: float = 0
+    m30_volume: float = 0
+    m30_vol_ma10: float = 0
+    m30_price_change_pct: float = 0
+    m30_prev_change_pct: float = 0     # nến M30 trước đó (để xem trend M30)
+    m30_available: bool = False
 
 @dataclass
 class ScoreResult:
@@ -171,6 +181,9 @@ class ScoreResult:
     timeframe: str = "1D"       # "1D" hoặc "1H" hoặc "REV"
     reversal_type: str = ""     # "PUMP_REVERSAL" / "DUMP_REVERSAL"
     h1_chg: float = 0           # % thay đổi nến 1H gần nhất
+    m30_chg: float = 0          # % thay đổi nến M30 gần nhất (xác nhận)
+    m30_confirmed: bool = False  # M30 cùng chiều với tín hiệu reversal
+    h1_minutes_left: int = 0    # Số phút còn lại đến khi nến H1 đóng
     # TP/SL cho Reversal signals
     entry: float = 0
     sl: float = 0
@@ -495,6 +508,72 @@ def get_ohlcv_1h(exchange: str, symbol: str, limit: int = 20) -> Optional[list]:
     return None
 
 
+# ── M30 OHLCV ────────────────────────────────────────────────
+
+def get_binance_ohlcv_m30(symbol: str, limit: int = 15) -> Optional[list]:
+    data = http_get_quick(f"{BINANCE_BASE}/fapi/v1/klines", {
+        "symbol": symbol,
+        "interval": "30m",
+        "limit": limit,
+    })
+    if not data or not isinstance(data, list):
+        return None
+    return [{"t": int(r[0]), "o": float(r[1]), "h": float(r[2]),
+             "l": float(r[3]), "c": float(r[4]), "v": float(r[5])} for r in data]
+
+
+def get_bybit_ohlcv_m30(symbol: str, limit: int = 15) -> Optional[list]:
+    data = bybit_get("/v5/market/kline", {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "30",
+        "limit": limit,
+    })
+    if not data:
+        return None
+    rows = list(reversed(data.get("list", [])))
+    return [{"t": int(r[0]), "o": float(r[1]), "h": float(r[2]),
+             "l": float(r[3]), "c": float(r[4]), "v": float(r[5])} for r in rows] if rows else None
+
+
+def get_bingx_ohlcv_m30(symbol: str, limit: int = 15) -> Optional[list]:
+    api_symbol = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else symbol
+    data = http_get_quick(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", {
+        "symbol": api_symbol,
+        "interval": "30m",
+        "limit": limit,
+    })
+    if not data:
+        return None
+    rows = data.get("data", []) if isinstance(data, dict) else data
+    if not rows or not isinstance(rows, list):
+        return None
+    candles = []
+    for row in rows:
+        try:
+            candles.append({
+                "t": int(row.get("time", row[0] if isinstance(row, list) else 0)),
+                "o": float(row.get("open",  row[1] if isinstance(row, list) else 0)),
+                "h": float(row.get("high",  row[2] if isinstance(row, list) else 0)),
+                "l": float(row.get("low",   row[3] if isinstance(row, list) else 0)),
+                "c": float(row.get("close", row[4] if isinstance(row, list) else 0)),
+                "v": float(row.get("volume",row[5] if isinstance(row, list) else 0)),
+            })
+        except Exception:
+            continue
+    return candles if candles else None
+
+
+def get_ohlcv_m30(exchange: str, symbol: str, limit: int = 15) -> Optional[list]:
+    if exchange == "Binance":
+        return get_binance_ohlcv_m30(symbol, limit)
+    if exchange == "Bybit":
+        return get_bybit_ohlcv_m30(symbol, limit)
+    if exchange == "BingX":
+        return get_bingx_ohlcv_m30(symbol, limit)
+    return None
+
+
 # ══════════════════════════════════════════════════════════════
 # FUNDING / OI / LSR / LIQUIDATION
 # Ưu tiên Binance/Bybit public API để tránh Coinglass bị 500.
@@ -723,6 +802,29 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
             prev_h1_vols = [float(c.get("v", 0)) for c in h1_candles[-11:-1]]
             coin.h1_vol_ma10 = sum(prev_h1_vols) / len(prev_h1_vols) if prev_h1_vols else 0
             coin.h1_available = True
+
+    # ── M30 data — xác nhận momentum cho reversal scan ───────────
+    if ENABLE_1H_REVERSAL:
+        m30_candles = get_ohlcv_m30(exchange, symbol, limit=15)
+        if m30_candles and len(m30_candles) >= 12:
+            # m30[-1] = nến M30 đang mở (hoặc vừa đóng)
+            # m30[-2] = nến M30 đã đóng gần nhất
+            m30_last   = m30_candles[-1]
+            m30_prev   = m30_candles[-2]
+            coin.m30_open   = float(m30_last.get("o", 0))
+            coin.m30_close  = float(m30_last.get("c", 0))
+            coin.m30_high   = float(m30_last.get("h", 0))
+            coin.m30_low    = float(m30_last.get("l", 0))
+            coin.m30_volume = float(m30_last.get("v", 0))
+            if coin.m30_open > 0:
+                coin.m30_price_change_pct = (coin.m30_close - coin.m30_open) / coin.m30_open * 100
+            prev_m30_o = float(m30_prev.get("o", 0))
+            prev_m30_c = float(m30_prev.get("c", 0))
+            if prev_m30_o > 0:
+                coin.m30_prev_change_pct = (prev_m30_c - prev_m30_o) / prev_m30_o * 100
+            prev_m30_vols = [float(c.get("v", 0)) for c in m30_candles[-11:-1]]
+            coin.m30_vol_ma10 = sum(prev_m30_vols) / len(prev_m30_vols) if prev_m30_vols else 0
+            coin.m30_available = True
 
     return coin
 
@@ -1454,6 +1556,72 @@ def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < MIN_REVERSAL_SCORE:
         return None
 
+    # ── M30 Confirmation ─────────────────────────────────────────
+    # Dùng nến M30 để xác nhận / cập nhật tín hiệu H1
+    # M30 cùng chiều = tín hiệu mạnh hơn, ngược chiều = cảnh báo
+    if coin.m30_available:
+        m30_chg      = coin.m30_price_change_pct
+        m30_prev_chg = coin.m30_prev_change_pct
+        m30_vol_ratio = coin.m30_volume / coin.m30_vol_ma10 if coin.m30_vol_ma10 > 0 else 0
+
+        result.m30_chg = round(m30_chg, 2)
+
+        if result.reversal_type == "DUMP_REVERSAL":
+            # M30 xanh = xác nhận bật ngược
+            if m30_chg > 0 and m30_prev_chg > 0:
+                # 2 nến M30 liên tiếp xanh = momentum đang hình thành
+                result.total_score += 1.5
+                result.m30_confirmed = True
+                result.details.append(f"✅ M30 xác nhận: 2 nến xanh ({m30_prev_chg:+.1f}% → {m30_chg:+.1f}%)")
+            elif m30_chg > 0:
+                result.total_score += 0.8
+                result.m30_confirmed = True
+                result.details.append(f"✅ M30 xác nhận: nến xanh ({m30_chg:+.1f}%)")
+            elif m30_chg < -2:
+                # M30 đỏ ngược chiều = cảnh báo, trừ điểm
+                result.total_score -= 1.0
+                result.details.append(f"⚠️ M30 ngược chiều ({m30_chg:.1f}%) — chờ xác nhận")
+            else:
+                result.details.append(f"➡️ M30 sideway ({m30_chg:+.1f}%)")
+
+            # M30 vol spike = xác nhận mua vào thực sự
+            if m30_vol_ratio >= 3:
+                result.total_score += 1.0
+                result.details.append(f"💥 M30 vol spike ({m30_vol_ratio:.1f}x)")
+            elif m30_vol_ratio >= 1.5:
+                result.total_score += 0.5
+                result.details.append(f"📊 M30 vol tăng ({m30_vol_ratio:.1f}x)")
+
+        else:  # PUMP_REVERSAL
+            # M30 đỏ = xác nhận đảo chiều xuống
+            if m30_chg < 0 and m30_prev_chg < 0:
+                result.total_score += 1.5
+                result.m30_confirmed = True
+                result.details.append(f"✅ M30 xác nhận: 2 nến đỏ ({m30_prev_chg:+.1f}% → {m30_chg:+.1f}%)")
+            elif m30_chg < 0:
+                result.total_score += 0.8
+                result.m30_confirmed = True
+                result.details.append(f"✅ M30 xác nhận: nến đỏ ({m30_chg:+.1f}%)")
+            elif m30_chg > 2:
+                result.total_score -= 1.0
+                result.details.append(f"⚠️ M30 ngược chiều ({m30_chg:+.1f}%) — chờ xác nhận")
+            else:
+                result.details.append(f"➡️ M30 sideway ({m30_chg:+.1f}%)")
+
+            if m30_vol_ratio >= 3:
+                result.total_score += 1.0
+                result.details.append(f"💥 M30 vol spike ({m30_vol_ratio:.1f}x)")
+            elif m30_vol_ratio >= 1.5:
+                result.total_score += 0.5
+                result.details.append(f"📊 M30 vol tăng ({m30_vol_ratio:.1f}x)")
+
+        result.total_score = round(result.total_score, 1)
+
+    # Tính số phút còn lại đến khi nến H1 đóng
+    now_utc = datetime.now(timezone.utc)
+    mins_into_hour = now_utc.minute + now_utc.second / 60
+    result.h1_minutes_left = max(0, int(60 - mins_into_hour))
+
     # Tính TP/SL dựa trên momentum 1H
     calc_reversal_tp(result, coin)
 
@@ -1763,11 +1931,22 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                     f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
                 )
 
+            # M30 status
+            if r.m30_confirmed:
+                m30_tag = f"✅ M30: {r.m30_chg:+.2f}%"
+            elif r.m30_chg != 0:
+                m30_tag = f"⚠️ M30: {r.m30_chg:+.2f}%"
+            else:
+                m30_tag = ""
+
+            h1_tag = f"⏱️ H1 còn ~{r.h1_minutes_left}phút" if r.h1_minutes_left > 0 else "⏱️ H1 vừa đóng"
+
             lines.append(
                 f"{rev_icon} <b>{rev_label}</b>\n"
                 f"<b>{symbol}</b> — {exchange} — <b>{r.total_score:.1f}đ</b>\n"
                 f"⚡ <b>{signal}</b>\n"
-                f"💰 {chg_line} | Vol: {r.vol_ratio}x | FR: {r.fr:.4f}%"
+                f"💰 {chg_line} | FR: {r.fr:.4f}%\n"
+                f"{m30_tag + ' | ' if m30_tag else ''}{h1_tag}"
             )
             if tp_block:
                 lines.append(tp_block)
@@ -1903,11 +2082,11 @@ def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
 
 
 def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
-    """Alert gọn cho scan 30 phút — chỉ hiện Reversal signals có TP/SL."""
+    """Alert gọn cho scan 30 phút — Reversal signals với M30 xác nhận + TP/SL."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"🔄 <b>REVERSAL UPDATE — {now}</b>",
-        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H scan\n",
+        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H + M30\n",
     ]
 
     for r in rev_results:
@@ -1919,12 +2098,24 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
             rev_icon  = "🔴🔄"
             rev_label = "PUMP → SHORT"
             chg_line  = f"1D: +{r.price_chg:.2f}% | 1H: {r.h1_chg:.2f}%"
-            sl_label  = "SL"
         else:
             rev_icon  = "🟢🔄"
             rev_label = "DUMP → LONG"
             chg_line  = f"1D: {r.price_chg:.2f}% | 1H: +{r.h1_chg:.2f}%"
-            sl_label  = "SL"
+
+        # M30 status tag
+        if r.m30_confirmed:
+            m30_tag = f"✅ M30: {r.m30_chg:+.2f}% (xác nhận)"
+        elif r.m30_chg != 0:
+            m30_tag = f"⚠️ M30: {r.m30_chg:+.2f}% (chưa xác nhận)"
+        else:
+            m30_tag = "M30: N/A"
+
+        # H1 time remaining tag
+        if r.h1_minutes_left > 0:
+            h1_tag = f"⏱️ H1 còn ~{r.h1_minutes_left}phút"
+        else:
+            h1_tag = "⏱️ H1 vừa đóng"
 
         def pct(target: float, entry: float) -> str:
             if entry <= 0: return ""
@@ -1932,11 +2123,12 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
 
         lines.append(f"{rev_icon} <b>{rev_label} — {symbol}</b> · {exchange} — <b>{r.total_score:.1f}đ</b>")
         lines.append(f"⚡ <b>{signal}</b>")
-        lines.append(f"💰 {chg_line} | Vol: {r.vol_ratio}x | FR: {r.fr:.4f}%")
+        lines.append(f"💰 {chg_line}")
+        lines.append(f"{m30_tag} | {h1_tag} | FR: {r.fr:.4f}%")
 
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
-                f"📍 Entry: <b>{r.entry:.6g}</b> | {sl_label}: <b>{r.sl:.6g}</b>\n"
+                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
                 f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
                 f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
                 f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
