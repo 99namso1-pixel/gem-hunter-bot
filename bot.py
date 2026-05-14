@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║  CRYPTO PUMP & DUMP SCANNER BOT V5                          ║
-║  Quét USDT Perp: Binance, Bybit, BingX                      ║
+║  Quét USDT Perp: Binance, Bybit, BingX, KuCoin               ║
 ║  1D Trend/Squeeze + 1H Reversal Engine → Telegram           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -27,7 +27,7 @@ from config import (
 )
 
 # Có thể sửa nhanh tại đây
-SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Quét cả 3 sàn
+SCAN_EXCHANGES = ["Binance", "Bybit", "BingX", "KuCoin"]  # Quét cả 4 sàn
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
@@ -61,9 +61,14 @@ HYBRID_MIN_SCORE = 5.0                  # Cả trend + squeeze đều mạnh
 
 # Tăng tốc scan
 FAST_SCAN = True
-MAX_WORKERS_BINANCE = 12   # Nếu bị rate-limit thì giảm còn 6-8
-MAX_WORKERS_BYBIT  = 10    # Nếu bị rate-limit thì giảm còn 5-8
-MAX_WORKERS_BINGX  = 8     # BingX rate limit thấp hơn
+MAX_WORKERS_BINANCE = 12   # Giữ — Binance weight-based, 12 là sweet spot
+MAX_WORKERS_BYBIT  = 15   # Bybit limit 120 req/s, còn dư nhiều
+MAX_WORKERS_BINGX  = 6    # BingX limit 10 req/s thực tế
+MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
+KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
+
+# Số workers tối đa cho parallel exchange scan (4 sàn chạy đồng thời)
+MAX_WORKERS_EXCHANGES = 4  # Chạy Binance + Bybit + BingX + KuCoin song song
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
 
 # ── Logging ──────────────────────────────────────────────────
@@ -82,6 +87,11 @@ COINGLASS_BASE = "https://open-api-v3.coinglass.com/api"
 BINANCE_BASE = "https://fapi.binance.com"
 BYBIT_BASE  = "https://api.bybit.com"
 BINGX_BASE  = "https://open-api.bingx.com"
+KUCOIN_BASE = "https://api-futures.kucoin.com"   # KuCoin Futures public API
+
+# Rate limiter cho KuCoin — semaphore + delay để tránh 429
+import threading as _threading
+_kucoin_lock = _threading.Semaphore(MAX_WORKERS_KUCOIN)
 
 CG_HEADERS = {
     "accept": "application/json",
@@ -196,7 +206,15 @@ class ScoreResult:
 
     @property
     def display_symbol(self) -> str:
-        return f"{self.symbol} · {self.exchange}"
+        s = self.symbol
+        # KuCoin format: BTCUSDTM → BTC
+        if s.endswith("USDTM"):
+            base = s[:-5]
+        elif s.endswith("USDT"):
+            base = s[:-4]
+        else:
+            base = s
+        return f"{base} · {self.exchange}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -334,10 +352,147 @@ def get_all_symbols(exchange: str) -> list[str]:
         return get_bybit_symbols()
     if exchange == "BingX":
         return get_bingx_symbols()
+    if exchange == "KuCoin":
+        return get_kucoin_symbols()
     raise ValueError(f"Unsupported exchange: {exchange}")
 
 
 # ══════════════════════════════════════════════════════════════
+# KUCOIN API
+# ══════════════════════════════════════════════════════════════
+
+def _kucoin_http(url: str, params: dict | None = None, timeout: int = 12) -> Optional[Any]:
+    """
+    KuCoin HTTP với throttle + 429 backoff.
+    Semaphore giới hạn concurrent, delay sau mỗi request, retry dài hơn khi 429.
+    """
+    with _kucoin_lock:
+        for attempt in range(3):
+            try:
+                r = get_session().get(url, params=params or {}, timeout=timeout)
+                if r.status_code == 429:
+                    wait = 3.0 * (attempt + 1)   # 3s, 6s, 9s
+                    log.debug(f"KuCoin 429 → đợi {wait:.0f}s rồi retry ({attempt+1}/3)...")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                time.sleep(KUCOIN_REQUEST_DELAY)  # throttle sau mỗi success
+                return r.json()
+            except requests.RequestException as e:
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    log.debug(f"KuCoin GET failed (3/3): {url} — {e}")
+    return None
+
+
+def _kucoin_parse_response(data: Any) -> Optional[Any]:
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        code = str(data.get("code", "200000"))
+        if code in ("200000", "0", "200"):
+            return data.get("data", data)
+        if "data" in data:
+            return data["data"]
+    return data
+
+
+def kucoin_get(endpoint: str, params: dict | None = None) -> Optional[Any]:
+    """KuCoin Futures public API helper — có throttle."""
+    data = _kucoin_http(f"{KUCOIN_BASE}{endpoint}", params=params or {}, timeout=15)
+    return _kucoin_parse_response(data)
+
+
+def kucoin_get_quick(endpoint: str, params: dict | None = None) -> Optional[Any]:
+    """KuCoin quick (timeout ngắn hơn) — có throttle."""
+    data = _kucoin_http(f"{KUCOIN_BASE}{endpoint}", params=params or {}, timeout=8)
+    return _kucoin_parse_response(data)
+
+
+def get_kucoin_symbols() -> list[str]:
+    log.info("Fetching KuCoin USDT Perp symbols...")
+    data = kucoin_get("/api/v1/contracts/active")
+    if not data or not isinstance(data, list):
+        log.warning("KuCoin: không lấy được symbol list")
+        return []
+    symbols = []
+    for s in data:
+        sym    = s.get("symbol", "")
+        settle = s.get("settleCurrency", "")
+        status = s.get("status", "")
+        # KuCoin futures symbol: BTCUSDTM (suffix M)
+        if settle == "USDT" and status == "Open" and sym.endswith("USDTM"):
+            symbols.append(sym)
+    log.info(f"Found {len(symbols)} KuCoin USDT Perp symbols")
+    return sorted(set(symbols))
+
+
+def _kucoin_parse_candles(data: Any) -> Optional[list]:
+    """KuCoin kline → chuẩn hóa dict. Newest-first → cần reverse sau."""
+    if not data or not isinstance(data, list):
+        return None
+    candles = []
+    for row in data:
+        try:
+            if isinstance(row, list) and len(row) >= 6:
+                # [timestamp_ms, open, high, low, close, volume, turnover]
+                candles.append({
+                    "t": int(row[0]),
+                    "o": float(row[1]),
+                    "h": float(row[2]),
+                    "l": float(row[3]),
+                    "c": float(row[4]),
+                    "v": float(row[5]),
+                })
+        except Exception:
+            continue
+    return list(reversed(candles)) if candles else None  # oldest-first
+
+
+def get_kucoin_ohlcv(symbol: str, limit: int = 25) -> Optional[list]:
+    data = kucoin_get("/api/v1/kline/query", {
+        "symbol": symbol,
+        "granularity": 1440,   # 1440 phút = 1D
+        "limit": limit,
+    })
+    return _kucoin_parse_candles(data)
+
+
+def get_kucoin_ohlcv_1h(symbol: str, limit: int = 20) -> Optional[list]:
+    data = kucoin_get_quick("/api/v1/kline/query", {
+        "symbol": symbol,
+        "granularity": 60,
+        "limit": limit,
+    })
+    return _kucoin_parse_candles(data)
+
+
+def get_kucoin_ohlcv_m30(symbol: str, limit: int = 15) -> Optional[list]:
+    data = kucoin_get_quick("/api/v1/kline/query", {
+        "symbol": symbol,
+        "granularity": 30,
+        "limit": limit,
+    })
+    return _kucoin_parse_candles(data)
+
+
+def get_kucoin_funding_rate(symbol: str) -> Optional[float]:
+    data = kucoin_get_quick(f"/api/v1/funding-rate/{symbol}/current")
+    if data and isinstance(data, dict):
+        val = data.get("value") or data.get("fundingRate")
+        if val is not None:
+            return float(val)
+    return None
+
+
+def get_kucoin_oi(symbol: str) -> Optional[float]:
+    """OI snapshot từ contract info — KuCoin không có daily hist public."""
+    data = kucoin_get_quick(f"/api/v1/contracts/{symbol}")
+    if data and isinstance(data, dict):
+        oi = data.get("openInterest") or data.get("openInterestValue") or 0
+        return float(oi)
+    return None
 # OHLCV PUBLIC API
 # ══════════════════════════════════════════════════════════════
 
@@ -427,6 +582,8 @@ def get_ohlcv(exchange: str, symbol: str, limit: int = 25) -> Optional[list]:
         return get_bybit_ohlcv(symbol, limit)
     if exchange == "BingX":
         return get_bingx_ohlcv(symbol, limit)
+    if exchange == "KuCoin":
+        return get_kucoin_ohlcv(symbol, limit)
     return None
 
 
@@ -505,6 +662,8 @@ def get_ohlcv_1h(exchange: str, symbol: str, limit: int = 20) -> Optional[list]:
         return get_bybit_ohlcv_1h(symbol, limit)
     if exchange == "BingX":
         return get_bingx_ohlcv_1h(symbol, limit)
+    if exchange == "KuCoin":
+        return get_kucoin_ohlcv_1h(symbol, limit)
     return None
 
 
@@ -571,6 +730,8 @@ def get_ohlcv_m30(exchange: str, symbol: str, limit: int = 15) -> Optional[list]
         return get_bybit_ohlcv_m30(symbol, limit)
     if exchange == "BingX":
         return get_bingx_ohlcv_m30(symbol, limit)
+    if exchange == "KuCoin":
+        return get_kucoin_ohlcv_m30(symbol, limit)
     return None
 
 
@@ -629,6 +790,9 @@ def get_funding_rate(exchange: str, symbol: str) -> Optional[float]:
             if isinstance(rows, dict) and "lastFundingRate" in rows:
                 return float(rows["lastFundingRate"])
 
+    elif exchange == "KuCoin":
+        return get_kucoin_funding_rate(symbol)
+
     return None
 
 
@@ -671,6 +835,13 @@ def get_oi_history(exchange: str, symbol: str, limit: int = 6) -> Optional[list]
             rows = d.get("data", [])
             if isinstance(rows, list) and rows:
                 return [{"openInterest": float(x.get("openInterest", 0))} for x in rows]
+
+    elif exchange == "KuCoin":
+        # KuCoin không có daily OI hist public → dùng snapshot
+        # oi_change sẽ = 0 nhưng vẫn có OI tuyệt đối để tham khảo
+        oi = get_kucoin_oi(symbol)
+        if oi is not None:
+            return [{"openInterest": oi}] * limit
 
     return None
 
@@ -1659,7 +1830,7 @@ def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResul
     dump_results: list[ScoreResult] = []
     rev_results:  list[ScoreResult] = []
     errors = 0
-    workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BINGX if exchange == "BingX" else MAX_WORKERS_BYBIT
+    workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BINGX if exchange == "BingX" else MAX_WORKERS_KUCOIN if exchange == "KuCoin" else MAX_WORKERS_BYBIT
 
     log.info(f"🚀 {exchange}: scanning {len(symbols)} symbols với {workers} workers...")
 
@@ -1714,35 +1885,63 @@ def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResul
 
 def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     """
-    Quét cả 3 sàn, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
+    Quét cả 4 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
+
+    Kiến trúc parallel 2 tầng:
+      Tầng 1: 4 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=4)
+      Tầng 2: Mỗi sàn scan symbol của mình song song (workers riêng từng sàn)
 
     Quy tắc PUMP: SQUEEZE ưu tiên TOP 1, còn lại theo total_score.
     Quy tắc DUMP: top 2 theo total_score.
-    Quy tắc REVERSAL: top 2 — PUMP_REVERSAL và DUMP_REVERSAL riêng, mỗi loại top 1.
+    Quy tắc REVERSAL: top 1 mỗi loại (PUMP_REV + DUMP_REV).
     """
     TOP_PUMP = 2
     TOP_DUMP = 2
-    TOP_REV_EACH = 1   # top 1 mỗi loại reversal → tối đa 2 reversal signals
 
     all_pump: list[ScoreResult] = []
     all_dump: list[ScoreResult] = []
     all_rev:  list[ScoreResult] = []
 
-    for exchange in SCAN_EXCHANGES:
-        pump_ex, dump_ex, rev_ex = run_scan_exchange(exchange)
-        if PER_EXCHANGE_TOP_N:
-            all_pump.extend(pump_ex[:TOP_N_FINAL])
-            all_dump.extend(dump_ex[:TOP_N_FINAL])
-            all_rev.extend(rev_ex[:TOP_N_FINAL])
-        else:
-            all_pump.extend(pump_ex)
-            all_dump.extend(dump_ex)
-            all_rev.extend(rev_ex)
+    scan_start = time.time()
+    log.info(f"🚀 Parallel scan bắt đầu: {len(SCAN_EXCHANGES)} sàn đồng thời...")
+
+    # Tầng 1: 4 sàn chạy song song
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        future_map = {
+            ex_pool.submit(run_scan_exchange, exchange): exchange
+            for exchange in SCAN_EXCHANGES
+        }
+        for future in as_completed(future_map):
+            exchange = future_map[future]
+            try:
+                pump_ex, dump_ex, rev_ex = future.result()
+                if PER_EXCHANGE_TOP_N:
+                    all_pump.extend(pump_ex[:TOP_N_FINAL])
+                    all_dump.extend(dump_ex[:TOP_N_FINAL])
+                    all_rev.extend(rev_ex[:TOP_N_FINAL])
+                else:
+                    all_pump.extend(pump_ex)
+                    all_dump.extend(dump_ex)
+                    all_rev.extend(rev_ex)
+                log.info(
+                    f"✅ {exchange} xong: "
+                    f"pump {len(pump_ex)} | dump {len(dump_ex)} | rev {len(rev_ex)} "
+                    f"| elapsed {time.time()-scan_start:.0f}s"
+                )
+            except Exception as e:
+                log.error(f"❌ {exchange} scan error: {e}", exc_info=True)
+
+    log.info(f"⏱️ Parallel scan hoàn tất trong {time.time()-scan_start:.1f}s")
+    log.info(f"   Tổng trước dedup: pump {len(all_pump)} | dump {len(all_dump)} | rev {len(all_rev)}")
 
     def dedup(lst: list[ScoreResult]) -> list[ScoreResult]:
+        """Cùng symbol giữ bản có điểm cao nhất."""
         seen: dict[str, ScoreResult] = {}
         for r in sorted(lst, key=lambda x: x.total_score, reverse=True):
             base = r.symbol.upper()
+            # Với KuCoin symbol BTCUSDTM, strip M để dedup với BTCUSDT của sàn khác
+            if base.endswith("USDTM"):
+                base = base[:-1]  # BTCUSDTM → BTCUSDT
             if base not in seen:
                 seen[base] = r
         return list(seen.values())
@@ -1762,7 +1961,7 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     if squeezes:
         top_squeeze = squeezes[0]
         final_pump.append(top_squeeze)
-        remaining = [r for r in unique_pump if r.symbol.upper() != top_squeeze.symbol.upper()]
+        remaining = [r for r in unique_pump if r.symbol.upper().rstrip("M") != top_squeeze.symbol.upper().rstrip("M")]
     else:
         remaining = unique_pump
     remaining.sort(key=lambda x: x.total_score, reverse=True)
@@ -1816,7 +2015,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                  rev_results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"🚀📉🔄 <b>PUMP &amp; DUMP &amp; REVERSAL SCANNER V5</b>",
+        f"🚀📉🔄 <b>PUMP &amp; DUMP &amp; REVERSAL SCANNER V6</b>",
         f"🕒 <b>{now}</b>",
         f"📊 Quét: {' | '.join(SCAN_EXCHANGES)} — 1D + 1H\n",
     ]
@@ -1950,8 +2149,6 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             )
             if tp_block:
                 lines.append(tp_block)
-            if details:
-                lines.append(f"<i>{details}</i>")
             lines.append("")
     else:
         lines.append("<i>Không có reversal signal trong giờ này.</i>\n")
@@ -2027,19 +2224,21 @@ def save_results(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 def run_reversal_scan() -> list[ScoreResult]:
     """
     Chỉ scan Reversal (1H) — dùng cho job 30 phút.
-    Quét cả 3 sàn, dedup, trả về top 1 mỗi loại (PUMP_REV + DUMP_REV).
-    Nhanh hơn full scan vì chỉ cần 1H OHLCV + FR + OI, bỏ qua score_pump/dump.
+    4 sàn chạy SONG SONG, dedup, trả về top 1 mỗi loại.
     """
     all_rev: list[ScoreResult] = []
+    scan_start = time.time()
 
-    for exchange in SCAN_EXCHANGES:
+    def _scan_exchange_reversal(exchange: str) -> list[ScoreResult]:
         symbols = get_all_symbols(exchange)
         if not symbols:
-            continue
-
-        workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BINGX if exchange == "BingX" else MAX_WORKERS_BYBIT
+            return []
+        workers = (MAX_WORKERS_BINANCE if exchange == "Binance"
+                   else MAX_WORKERS_BINGX if exchange == "BingX"
+                   else MAX_WORKERS_KUCOIN if exchange == "KuCoin"
+                   else MAX_WORKERS_BYBIT)
         log.info(f"🔄 Reversal scan {exchange}: {len(symbols)} symbols...")
-
+        results = []
         completed = 0
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {executor.submit(_reversal_only, exchange, s): s for s in symbols}
@@ -2048,20 +2247,35 @@ def run_reversal_scan() -> list[ScoreResult]:
                 try:
                     rev = future.result()
                     if rev:
-                        all_rev.append(rev)
+                        results.append(rev)
                 except Exception as e:
                     log.debug(f"  ❌ {exchange} {future_map[future]}: {e}")
                 if completed % LOG_EVERY_N == 0 or completed == len(symbols):
-                    log.info(f"  [{exchange}] {completed}/{len(symbols)} | rev {len(all_rev)}")
+                    log.info(f"  [{exchange}] {completed}/{len(symbols)} | rev {len(results)}")
+        log.info(f"✅ {exchange} reversal xong: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
 
-    # Dedup theo symbol, giữ điểm cao nhất
+    # 4 sàn song song
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        futures = {ex_pool.submit(_scan_exchange_reversal, ex): ex for ex in SCAN_EXCHANGES}
+        for future in as_completed(futures):
+            try:
+                all_rev.extend(future.result())
+            except Exception as e:
+                log.error(f"❌ Reversal scan error {futures[future]}: {e}")
+
+    log.info(f"⏱️ Reversal parallel scan xong: {time.time()-scan_start:.1f}s | {len(all_rev)} total")
+
+    # Dedup — KuCoin USDTM → strip M trước khi so sánh
     seen: dict[str, ScoreResult] = {}
     for r in sorted(all_rev, key=lambda x: x.total_score, reverse=True):
-        if r.symbol.upper() not in seen:
-            seen[r.symbol.upper()] = r
+        base = r.symbol.upper()
+        if base.endswith("USDTM"):
+            base = base[:-1]
+        if base not in seen:
+            seen[base] = r
     unique = list(seen.values())
 
-    # Top 1 mỗi loại
     pump_revs = sorted([r for r in unique if r.reversal_type == "PUMP_REVERSAL"],
                        key=lambda x: x.total_score, reverse=True)
     dump_revs = sorted([r for r in unique if r.reversal_type == "DUMP_REVERSAL"],
