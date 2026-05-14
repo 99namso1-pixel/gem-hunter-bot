@@ -43,6 +43,7 @@ MIN_DUMP_SCORE = 3.0                   # Ngưỡng điểm tối thiểu để l
 # ── 1H Reversal Engine ────────────────────────────────────────
 ENABLE_1H_REVERSAL = True              # Bật/tắt scan 1H reversal
 ENABLE_30MIN_SCAN = True               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
+DAILY_SCAN_HOUR   = 0                  # Giờ UTC chạy full scan 1D (0 = 00:02 UTC)
 # Pump Reversal: coin pump mạnh 1D nhưng 1H đang đảo chiều xuống
 PUMP_REV_1D_MIN_PUMP = 10.0           # 1D tăng tối thiểu 10% trước đó
 PUMP_REV_1H_DROP = 3.0                # 1H hiện tại giảm ≥ 3%
@@ -53,6 +54,14 @@ DUMP_REV_1H_PUMP = 3.0                # 1H hiện tại tăng ≥ 3%
 DUMP_REV_1H_VOL_MULT = 1.5            # Vol 1H ≥ 1.5x MA10_1H
 INTRADAY_DUMP_MIN = 15.0              # Intraday dump (open→low) ≥ 15% trong nến ngày hiện tại
 MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt reversal list
+
+# ── 1H Momentum Breakout ──────────────────────────────────────
+# Signal độc lập với 1D — bắt nến 1H pump/dump mạnh có vol spike
+# Ví dụ: MLNUSDT 07:00 UTC 14/5 — +10.37% vol 9.3x FR âm
+H1_BREAKOUT_MIN_CHG     = 8.0    # 1H thay đổi tối thiểu (pump hoặc dump)
+H1_BREAKOUT_MIN_VOL     = 5.0    # vol_ratio 1H tối thiểu (x MA10)
+H1_BREAKOUT_MIN_SCORE   = 4.0    # Điểm tối thiểu để alert
+H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 
 # Engine mode
 TREND_MIN_SCORE = 5.0                   # Ngưỡng nhận diện TREND coin kiểu IRYS
@@ -189,7 +198,7 @@ class ScoreResult:
     price_current: float = 0    # Giá hiện tại (close nến gần nhất)
     day_low: float = 0          # Giá thấp nhất trong ngày
     timeframe: str = "1D"       # "1D" hoặc "1H" hoặc "REV"
-    reversal_type: str = ""     # "PUMP_REVERSAL" / "DUMP_REVERSAL"
+    reversal_type: str = ""     # "PUMP_REVERSAL" / "DUMP_REVERSAL" / "H1_BREAKOUT_LONG" / "H1_BREAKOUT_SHORT"
     h1_chg: float = 0           # % thay đổi nến 1H gần nhất
     m30_chg: float = 0          # % thay đổi nến M30 gần nhất (xác nhận)
     m30_confirmed: bool = False  # M30 cùng chiều với tín hiệu reversal
@@ -1803,6 +1812,226 @@ def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
 # SCANNER
 # ══════════════════════════════════════════════════════════════
 
+def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
+    """
+    1H Momentum Breakout — signal độc lập với 1D.
+
+    Điều kiện cần:
+      • h1_available = True
+      • |h1_chg| ≥ H1_BREAKOUT_MIN_CHG (8%)
+      • h1_vol_ratio ≥ H1_BREAKOUT_MIN_VOL (5x)
+
+    2 chiều:
+      • H1_BREAKOUT_LONG  : h1_chg ≥ +8%, vol ≥ 5x → pump mạnh, có thể long
+      • H1_BREAKOUT_SHORT : h1_chg ≤ -8%, vol ≥ 5x → dump mạnh, có thể short
+
+    Bổ sung điểm từ:
+      • FR âm sâu (short squeeze fuel cho long)
+      • FR dương cao (long trap → xác nhận short)
+      • OI tăng cùng chiều
+      • M30 xác nhận
+      • Liq cùng chiều
+    """
+    if not coin.h1_available:
+        return None
+    if coin.h1_vol_ma10 <= 0:
+        return None
+
+    h1_chg       = coin.h1_price_change_pct
+    h1_vol_ratio = coin.h1_volume / coin.h1_vol_ma10
+    fr_pct       = coin.funding_rate * 100
+    abs_chg      = abs(h1_chg)
+
+    # Filter cơ bản
+    if abs_chg < H1_BREAKOUT_MIN_CHG:
+        return None
+    if h1_vol_ratio < H1_BREAKOUT_MIN_VOL:
+        return None
+
+    is_long  = h1_chg > 0
+    is_short = h1_chg < 0
+
+    result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    result.timeframe    = "1H-BO"
+    result.vol_ratio    = round(h1_vol_ratio, 2)
+    result.oi_chg_pct   = round(coin.oi_change_pct, 1)
+    result.fr           = round(fr_pct, 4)
+    result.lsr          = round(coin.lsr, 4)
+    result.liq_ratio    = round(coin.liq_ratio, 2)
+    result.price_current = round(coin.h1_close, 8)
+    result.day_low       = round(coin.h1_low, 8)
+    result.h1_chg        = round(h1_chg, 2)
+    result.price_chg     = round(coin.price_change_pct, 2)
+
+    score   = 0.0
+    details = []
+
+    if is_long:
+        result.reversal_type = "H1_BREAKOUT_LONG"
+        details.append(f"🚀 H1 Breakout Long: +{h1_chg:.1f}% vol {h1_vol_ratio:.1f}x")
+
+        # Momentum 1H
+        if abs_chg >= 20:
+            score += 3.0; details.append(f"🔥 H1 cực mạnh (+{abs_chg:.1f}%)")
+        elif abs_chg >= 12:
+            score += 2.5; details.append(f"💪 H1 rất mạnh (+{abs_chg:.1f}%)")
+        elif abs_chg >= 8:
+            score += 2.0; details.append(f"📈 H1 mạnh (+{abs_chg:.1f}%)")
+
+        # Vol spike
+        if h1_vol_ratio >= 10:
+            score += 3.0; details.append(f"💥 Vol spike cực mạnh ({h1_vol_ratio:.1f}x)")
+        elif h1_vol_ratio >= 7:
+            score += 2.5; details.append(f"💥 Vol spike rất mạnh ({h1_vol_ratio:.1f}x)")
+        elif h1_vol_ratio >= 5:
+            score += 2.0; details.append(f"📊 Vol spike ({h1_vol_ratio:.1f}x)")
+
+        # FR âm → shorts đang trả phí → squeeze fuel → cộng điểm
+        if fr_pct <= -0.5:
+            score += 3.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%) — short squeeze")
+        elif fr_pct <= -0.2:
+            score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%) — squeeze fuel")
+        elif fr_pct <= H1_BREAKOUT_FR_BONUS:
+            score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
+
+        # OI tăng khi giá tăng = long mới vào = momentum thật
+        if coin.oi_change_pct >= 15:
+            score += 1.5; details.append(f"📡 OI tăng mạnh (+{coin.oi_change_pct:.1f}%) — long vào")
+        elif coin.oi_change_pct >= 5:
+            score += 0.5; details.append(f"📡 OI tăng ({coin.oi_change_pct:.1f}%)")
+        # OI giảm khi giá tăng = short đang cover = cũng tốt
+        elif coin.oi_change_pct <= -5:
+            score += 1.0; details.append(f"📡 OI giảm ({coin.oi_change_pct:.1f}%) — short cover")
+
+        # Liq: shorts bị liq = fuel
+        if coin.liq_ratio >= 3:
+            score += 1.5; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x")
+        elif coin.liq_ratio >= 1.5:
+            score += 0.5; details.append(f"✅ Shorts liq {coin.liq_ratio:.1f}x")
+
+        # Nến 1H xanh đẹp (thân dài, bóng ngắn)
+        h1_body  = abs(coin.h1_close - coin.h1_open)
+        h1_upper = coin.h1_high - coin.h1_close
+        if h1_body > 0 and h1_upper < h1_body * 0.3:
+            score += 0.5; details.append("✅ Nến 1H xanh thân dài")
+
+        # Signal label
+        if score >= 10:
+            result.signal_type = "🚀💥 H1 BREAKOUT LONG — CỰC MẠNH"
+        elif score >= 7:
+            result.signal_type = "🚀 H1 BREAKOUT LONG — RẤT MẠNH"
+        elif score >= 5:
+            result.signal_type = "📈 H1 BREAKOUT LONG"
+        else:
+            result.signal_type = "⚡ H1 Long Signal"
+
+    else:  # is_short
+        result.reversal_type = "H1_BREAKOUT_SHORT"
+        details.append(f"📉 H1 Breakout Short: {h1_chg:.1f}% vol {h1_vol_ratio:.1f}x")
+
+        # Momentum 1H dump
+        if abs_chg >= 20:
+            score += 3.0; details.append(f"🔥 H1 dump cực mạnh ({h1_chg:.1f}%)")
+        elif abs_chg >= 12:
+            score += 2.5; details.append(f"💪 H1 dump rất mạnh ({h1_chg:.1f}%)")
+        elif abs_chg >= 8:
+            score += 2.0; details.append(f"📉 H1 dump mạnh ({h1_chg:.1f}%)")
+
+        # Vol spike
+        if h1_vol_ratio >= 10:
+            score += 3.0; details.append(f"💥 Vol spike cực mạnh ({h1_vol_ratio:.1f}x)")
+        elif h1_vol_ratio >= 7:
+            score += 2.5; details.append(f"💥 Vol spike rất mạnh ({h1_vol_ratio:.1f}x)")
+        elif h1_vol_ratio >= 5:
+            score += 2.0; details.append(f"📊 Vol spike ({h1_vol_ratio:.1f}x)")
+
+        # FR dương cao = long trap = dump fuel
+        if fr_pct >= 0.2:
+            score += 2.0; details.append(f"💥 FR dương cao ({fr_pct:.3f}%) — long trap")
+        elif fr_pct >= 0.05:
+            score += 1.0; details.append(f"⚠️ FR dương ({fr_pct:.4f}%)")
+        # FR âm khi dump = shorts không tin tưởng, dump có thể đảo
+        elif fr_pct <= -0.2:
+            score -= 0.5; details.append(f"⚠️ FR âm ({fr_pct:.3f}%) — dump yếu hơn")
+
+        # OI tăng khi giá giảm = short mới vào = dump tiếp
+        if coin.oi_change_pct >= 15:
+            score += 1.5; details.append(f"📡 OI tăng ({coin.oi_change_pct:.1f}%) — short vào")
+        elif coin.oi_change_pct >= 5:
+            score += 0.5; details.append(f"📡 OI tăng nhẹ ({coin.oi_change_pct:.1f}%)")
+
+        # Liq: longs bị liq = cascade
+        if coin.liq_longs > 0:
+            lx = coin.liq_longs / max(coin.liq_shorts, 1)
+            if lx >= 5:
+                score += 2.0; details.append(f"💥 Longs liq {lx:.0f}x — cascade")
+            elif lx >= 2:
+                score += 1.0; details.append(f"✅ Longs liq {lx:.1f}x")
+
+        # Nến 1H đỏ thân dài
+        h1_body  = abs(coin.h1_close - coin.h1_open)
+        h1_upper = coin.h1_high - coin.h1_open
+        if h1_body > 0 and h1_upper < h1_body * 0.3:
+            score += 0.5; details.append("✅ Nến 1H đỏ thân dài")
+
+        # Signal label
+        if score >= 10:
+            result.signal_type = "📉💥 H1 BREAKOUT SHORT — CỰC MẠNH"
+        elif score >= 7:
+            result.signal_type = "📉 H1 BREAKOUT SHORT — RẤT MẠNH"
+        elif score >= 5:
+            result.signal_type = "⬇️ H1 BREAKOUT SHORT"
+        else:
+            result.signal_type = "⚡ H1 Short Signal"
+
+    # M30 xác nhận (giống reversal engine)
+    if coin.m30_available and coin.m30_vol_ma10 > 0:
+        m30_chg       = coin.m30_price_change_pct
+        m30_vol_ratio = coin.m30_volume / coin.m30_vol_ma10
+        result.m30_chg = round(m30_chg, 2)
+
+        if is_long:
+            if m30_chg > 0:
+                score += 1.0; result.m30_confirmed = True
+                details.append(f"✅ M30 xác nhận ({m30_chg:+.1f}%)")
+            elif m30_chg < -2:
+                score -= 0.5
+                details.append(f"⚠️ M30 ngược ({m30_chg:.1f}%)")
+        else:
+            if m30_chg < 0:
+                score += 1.0; result.m30_confirmed = True
+                details.append(f"✅ M30 xác nhận ({m30_chg:+.1f}%)")
+            elif m30_chg > 2:
+                score -= 0.5
+                details.append(f"⚠️ M30 ngược ({m30_chg:+.1f}%)")
+
+        if m30_vol_ratio >= 3:
+            score += 0.5; details.append(f"💥 M30 vol ({m30_vol_ratio:.1f}x)")
+
+    result.total_score = round(score, 1)
+    result.details     = details
+
+    # Số phút còn lại đến khi H1 đóng
+    now_utc = datetime.now(timezone.utc)
+    mins_into = now_utc.minute + now_utc.second / 60
+    result.h1_minutes_left = max(0, int(60 - mins_into))
+
+    if result.total_score < H1_BREAKOUT_MIN_SCORE:
+        return None
+
+    # Tính TP/SL — dùng lại calc_reversal_tp với map reversal_type
+    if is_long:
+        result.reversal_type = "DUMP_REVERSAL"   # map tạm để dùng LONG formula
+        calc_reversal_tp(result, coin)
+        result.reversal_type = "H1_BREAKOUT_LONG"
+    else:
+        result.reversal_type = "PUMP_REVERSAL"   # map tạm để dùng SHORT formula
+        calc_reversal_tp(result, coin)
+        result.reversal_type = "H1_BREAKOUT_SHORT"
+
+    return result
+
+
 def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     Optional[ScoreResult], Optional[ScoreResult], Optional[ScoreResult]
 ]:
@@ -1810,9 +2039,15 @@ def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     coin = fetch_coin_data(exchange, symbol)
     if coin is None:
         return None, None, None
-    pump    = score_coin_pump(coin)
-    dump    = score_coin_dump(coin)
-    reversal = score_reversal(coin)
+    pump = score_coin_pump(coin)
+    dump = score_coin_dump(coin)
+    # Lấy signal tốt nhất: reversal hoặc h1_breakout
+    rev1 = score_reversal(coin)
+    rev2 = score_h1_breakout(coin)
+    if rev1 and rev2:
+        reversal = rev1 if rev1.total_score >= rev2.total_score else rev2
+    else:
+        reversal = rev1 or rev2
     return pump, dump, reversal
 
 
@@ -1973,17 +2208,16 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     final_dump = unique_dump[:TOP_DUMP]
 
     # ── REVERSAL: top 1 mỗi loại ──────────────────────────────────
-    pump_revs = sorted(
-        [r for r in unique_rev if r.reversal_type == "PUMP_REVERSAL"],
-        key=lambda x: x.total_score, reverse=True
-    )
-    dump_revs = sorted(
-        [r for r in unique_rev if r.reversal_type == "DUMP_REVERSAL"],
-        key=lambda x: x.total_score, reverse=True
-    )
+    # ── REVERSAL: top 1 mỗi loại signal ─────────────────────────
+    def top1_by_type(rtype: str) -> Optional[ScoreResult]:
+        filtered = [r for r in unique_rev if r.reversal_type == rtype]
+        return max(filtered, key=lambda x: x.total_score) if filtered else None
+
     final_rev: list[ScoreResult] = []
-    if pump_revs: final_rev.append(pump_revs[0])
-    if dump_revs: final_rev.append(dump_revs[0])
+    for rtype in ("PUMP_REVERSAL", "DUMP_REVERSAL", "H1_BREAKOUT_LONG", "H1_BREAKOUT_SHORT"):
+        r = top1_by_type(rtype)
+        if r:
+            final_rev.append(r)
 
     return final_pump, final_dump, final_rev
 
@@ -2042,10 +2276,8 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             else:
                 mode_icon = "⚡"
 
-            symbol   = html.escape(str(r.symbol))
-            exchange = html.escape(str(r.exchange))
+            symbol   = html.escape(r.display_symbol)   # "BTC" không có sàn
             signal   = html.escape(str(r.signal_type))
-            details  = html.escape(" | ".join(str(x) for x in r.details[:4]))
             engine_info = ""
             if r.market_mode in ("SQUEEZE", "HYBRID"):
                 engine_info = f" | 🔴SQ:{r.squeeze_engine_score:.1f}"
@@ -2054,7 +2286,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
-                f"<b>{symbol}</b> — {exchange} — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
+                f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
                 f"{mode_icon} <b>{signal}</b>\n"
                 f"💰 Giá: <b>{r.price_current:.6g}</b> | Low ngày: {r.day_low:.6g} | +{r.price_chg:.2f}%"
             )
@@ -2075,14 +2307,12 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
     if dump_results:
         for i, r in enumerate(dump_results[:2]):
             badge, rank_name = dump_rank_styles[i] if i < len(dump_rank_styles) else ("⭐", "WATCHLIST")
-            symbol   = html.escape(str(r.symbol))
-            exchange = html.escape(str(r.exchange))
+            symbol   = html.escape(r.display_symbol)
             signal   = html.escape(str(r.signal_type))
-            details  = html.escape(" | ".join(str(x) for x in r.details[:4]))
 
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
-                f"<b>{symbol}</b> — {exchange} — <b>{r.total_score:.1f}đ</b>\n"
+                f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
                 f"📉 <b>{signal}</b>\n"
                 f"💰 Giá: <b>{r.price_current:.6g}</b> | Low ngày: {r.day_low:.6g} | {r.price_chg:.2f}%"
             )
@@ -2097,8 +2327,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 
     if rev_results:
         for r in rev_results:
-            symbol   = html.escape(str(r.symbol))
-            exchange = html.escape(str(r.exchange))
+            symbol   = html.escape(r.display_symbol)
             signal   = html.escape(str(r.signal_type))
             details  = html.escape(" | ".join(str(x) for x in r.details[:4]))
 
@@ -2108,12 +2337,24 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                 chg_line  = f"1D: +{r.price_chg:.2f}% | 1H: {r.h1_chg:.2f}%"
                 direction = "SHORT"
                 sl_label  = "SL (trên đỉnh)"
-            else:
+            elif r.reversal_type == "DUMP_REVERSAL":
                 rev_icon  = "🟢🔄"
                 rev_label = "DUMP → BẬT NGƯỢC LÊN (LONG)"
                 chg_line  = f"1D: {r.price_chg:.2f}% | 1H: +{r.h1_chg:.2f}%"
                 direction = "LONG"
                 sl_label  = "SL (dưới đáy)"
+            elif r.reversal_type == "H1_BREAKOUT_LONG":
+                rev_icon  = "🟢⚡"
+                rev_label = "H1 BREAKOUT — LONG"
+                chg_line  = f"1H: +{r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
+                direction = "LONG"
+                sl_label  = "SL (dưới đáy)"
+            else:  # H1_BREAKOUT_SHORT
+                rev_icon  = "🔴⚡"
+                rev_label = "H1 BREAKOUT — SHORT"
+                chg_line  = f"1H: {r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
+                direction = "SHORT"
+                sl_label  = "SL (trên đỉnh)"
 
             # Tính % thay đổi từ entry
             def pct(target: float, entry: float) -> str:
@@ -2142,7 +2383,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 
             lines.append(
                 f"{rev_icon} <b>{rev_label}</b>\n"
-                f"<b>{symbol}</b> — {exchange} — <b>{r.total_score:.1f}đ</b>\n"
+                f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
                 f"⚡ <b>{signal}</b>\n"
                 f"💰 {chg_line} | FR: {r.fr:.4f}%\n"
                 f"{m30_tag + ' | ' if m30_tag else ''}{h1_tag}"
@@ -2276,23 +2517,24 @@ def run_reversal_scan() -> list[ScoreResult]:
             seen[base] = r
     unique = list(seen.values())
 
-    pump_revs = sorted([r for r in unique if r.reversal_type == "PUMP_REVERSAL"],
-                       key=lambda x: x.total_score, reverse=True)
-    dump_revs = sorted([r for r in unique if r.reversal_type == "DUMP_REVERSAL"],
-                       key=lambda x: x.total_score, reverse=True)
-
     result: list[ScoreResult] = []
-    if pump_revs: result.append(pump_revs[0])
-    if dump_revs: result.append(dump_revs[0])
+    for rtype in ("PUMP_REVERSAL", "DUMP_REVERSAL", "H1_BREAKOUT_LONG", "H1_BREAKOUT_SHORT"):
+        filtered = [r for r in unique if r.reversal_type == rtype]
+        if filtered:
+            result.append(max(filtered, key=lambda x: x.total_score))
     return result
 
 
 def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
-    """Helper: fetch coin data và chỉ chạy score_reversal."""
+    """Helper: fetch coin data và chạy score_reversal + score_h1_breakout."""
     coin = fetch_coin_data(exchange, symbol)
     if coin is None:
         return None
-    return score_reversal(coin)
+    rev1 = score_reversal(coin)
+    rev2 = score_h1_breakout(coin)
+    if rev1 and rev2:
+        return rev1 if rev1.total_score >= rev2.total_score else rev2
+    return rev1 or rev2
 
 
 def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
@@ -2304,18 +2546,25 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
     ]
 
     for r in rev_results:
-        symbol   = html.escape(str(r.symbol))
-        exchange = html.escape(str(r.exchange))
+        symbol   = html.escape(r.display_symbol)
         signal   = html.escape(str(r.signal_type))
 
         if r.reversal_type == "PUMP_REVERSAL":
             rev_icon  = "🔴🔄"
             rev_label = "PUMP → SHORT"
             chg_line  = f"1D: +{r.price_chg:.2f}% | 1H: {r.h1_chg:.2f}%"
-        else:
+        elif r.reversal_type == "DUMP_REVERSAL":
             rev_icon  = "🟢🔄"
             rev_label = "DUMP → LONG"
             chg_line  = f"1D: {r.price_chg:.2f}% | 1H: +{r.h1_chg:.2f}%"
+        elif r.reversal_type == "H1_BREAKOUT_LONG":
+            rev_icon  = "🟢⚡"
+            rev_label = "H1 BREAKOUT — LONG"
+            chg_line  = f"1H: +{r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
+        else:  # H1_BREAKOUT_SHORT
+            rev_icon  = "🔴⚡"
+            rev_label = "H1 BREAKOUT — SHORT"
+            chg_line  = f"1H: {r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
 
         # M30 status tag
         if r.m30_confirmed:
@@ -2335,7 +2584,7 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
             if entry <= 0: return ""
             return f"{(target - entry) / entry * 100:+.2f}%"
 
-        lines.append(f"{rev_icon} <b>{rev_label} — {symbol}</b> · {exchange} — <b>{r.total_score:.1f}đ</b>")
+        lines.append(f"{rev_icon} <b>{rev_label} — {symbol}</b> — <b>{r.total_score:.1f}đ</b>")
         lines.append(f"⚡ <b>{signal}</b>")
         lines.append(f"💰 {chg_line}")
         lines.append(f"{m30_tag} | {h1_tag} | FR: {r.fr:.4f}%")
@@ -2474,39 +2723,60 @@ if __name__ == "__main__":
 
         from datetime import timedelta
 
-        FULL_SCAN_MINUTE = 2    # Full scan lúc xx:02 UTC
+        FULL_SCAN_MINUTE = 2    # Full scan lúc xx:02 UTC (mọi giờ)
         REV_SCAN_MINUTE  = 32   # Reversal scan lúc xx:32 UTC
         CHECK_SLEEP      = 30   # Kiểm tra lại mỗi 30 giây
 
         def next_slot_utc(now: datetime | None = None) -> tuple[datetime, str]:
             """
             Trả về (thời điểm slot kế tiếp, loại slot).
-            Loại: 'full' hoặc 'reversal'
+            Loại: 'daily' | 'full' | 'reversal'
+
+            Ưu tiên:
+              00:02 UTC → 'daily'  (full 1D scan chính thức sau khi nến ngày đóng)
+              xx:02 UTC → 'full'   (mọi giờ còn lại)
+              xx:32 UTC → 'reversal'
             """
             now = now or datetime.now(timezone.utc)
-            # 2 slot trong giờ hiện tại
             base = now.replace(second=0, microsecond=0)
+
+            # Slot daily: 00:02 UTC
+            slot_daily = base.replace(hour=DAILY_SCAN_HOUR, minute=FULL_SCAN_MINUTE)
+            if slot_daily <= now:
+                slot_daily += timedelta(days=1)
+
+            # Slot full: xx:02 UTC (giờ hiện tại hoặc kế tiếp, không phải 00:xx)
             slot_full = base.replace(minute=FULL_SCAN_MINUTE)
-            slot_rev  = base.replace(minute=REV_SCAN_MINUTE)
+            if slot_full <= now:
+                slot_full += timedelta(hours=1)
+            # Nếu slot_full trùng với slot_daily → bỏ slot_full (daily thay thế)
+            if slot_full == slot_daily:
+                slot_full += timedelta(hours=1)
 
-            # Tìm slot gần nhất trong tương lai
-            candidates = []
-            for slot, kind in [(slot_full, "full"), (slot_rev, "reversal")]:
-                if slot <= now:
-                    slot += timedelta(hours=1)
-                candidates.append((slot, kind))
+            # Slot reversal: xx:32 UTC
+            slot_rev = base.replace(minute=REV_SCAN_MINUTE)
+            if slot_rev <= now:
+                slot_rev += timedelta(hours=1)
 
+            candidates = [
+                (slot_daily, "daily"),
+                (slot_full,  "full"),
+                (slot_rev,   "reversal"),
+            ]
             candidates.sort(key=lambda x: x[0])
             return candidates[0]
 
-        log.info("⏰ SCHEDULER V2 khởi động")
-        log.info(f"   xx:{FULL_SCAN_MINUTE:02d} UTC → Full scan (PUMP + DUMP + REVERSAL)")
+        def slot_id(dt: datetime, kind: str) -> str:
+            return f"{dt.strftime('%Y%m%d%H%M')}_{kind}"
+
+        log.info("⏰ SCHEDULER V3 khởi động")
+        log.info(f"   00:{FULL_SCAN_MINUTE:02d} UTC → DAILY scan (1D chính thức sau nến ngày đóng)")
+        log.info(f"   xx:{FULL_SCAN_MINUTE:02d} UTC → Full scan (PUMP + DUMP + REVERSAL, mỗi giờ)")
         if ENABLE_30MIN_SCAN:
-            log.info(f"   xx:{REV_SCAN_MINUTE:02d} UTC → Reversal-only scan (1H, gửi nếu có signal)")
-        else:
-            log.info(f"   xx:{REV_SCAN_MINUTE:02d} UTC → Bỏ qua (ENABLE_30MIN_SCAN=False)")
+            log.info(f"   xx:{REV_SCAN_MINUTE:02d} UTC → Reversal scan (1H + M30 + H1 Breakout)")
         log.info("   Chạy '--now' để test full scan ngay")
-        log.info("   Test 1 coin: python bot.py --test-one SOLUSDT Binance")
+
+        last_executed_slot: str = ""
 
         while True:
             target, slot_kind = next_slot_utc()
@@ -2517,17 +2787,33 @@ if __name__ == "__main__":
                 wait = (target - now).total_seconds()
                 if wait <= 0:
                     break
-                log.info(
-                    f"⏳ Đợi {wait/60:.1f} phút đến "
-                    f"{target.strftime('%H:%M UTC')} "
-                    f"({'Full scan' if slot_kind == 'full' else 'Reversal scan'})..."
-                )
+                kind_label = {"daily": "Daily 1D scan", "full": "Full scan", "reversal": "Reversal scan"}.get(slot_kind, slot_kind)
+                log.info(f"⏳ Đợi {wait/60:.1f} phút đến {target.strftime('%H:%M UTC')} ({kind_label})...")
                 time.sleep(min(wait, CHECK_SLEEP))
+
+            # Anti-duplicate
+            current_slot = slot_id(target, slot_kind)
+            if current_slot == last_executed_slot:
+                log.warning(f"⚠️ Slot {current_slot} đã chạy rồi — bỏ qua")
+                time.sleep(60)
+                continue
 
             scan_start_dt = datetime.now(timezone.utc)
             scan_start    = time.time()
+            last_executed_slot = current_slot
 
-            if slot_kind == "full":
+            if slot_kind == "daily":
+                log.info(f"📅 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Daily 1D scan bắt đầu...")
+                try:
+                    job()   # Full scan bình thường — nến ngày vừa đóng lúc 00:00
+                except Exception as e:
+                    log.error(f"Daily scan error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ Daily scan error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+
+            elif slot_kind == "full":
                 log.info(f"🚀 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Full scan bắt đầu...")
                 try:
                     job()
@@ -2548,12 +2834,12 @@ if __name__ == "__main__":
                 else:
                     log.info(f"⏭️  Bỏ qua reversal slot (ENABLE_30MIN_SCAN=False)")
 
-            elapsed      = time.time() - scan_start
-            finished_dt  = datetime.now(timezone.utc)
+            elapsed     = time.time() - scan_start
+            finished_dt = datetime.now(timezone.utc)
             next_target, next_kind = next_slot_utc(finished_dt)
+            next_label  = {"daily": "Daily", "full": "Full", "reversal": "Reversal"}.get(next_kind, next_kind)
 
             log.info(
                 f"✅ Xong trong {elapsed:.0f}s — "
-                f"slot tiếp theo: {next_target.strftime('%H:%M UTC')} "
-                f"({'Full' if next_kind == 'full' else 'Reversal'})"
+                f"slot tiếp theo: {next_target.strftime('%H:%M UTC')} ({next_label})"
             )
