@@ -1125,16 +1125,33 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     if vol_ratio < MIN_VOL_RATIO_FILTER and coin.price_change_pct < MIN_PRICE_CHANGE_FILTER:
         return None
 
-    # 0. Momentum thật: ưu tiên coin đang chạy mạnh như IRYS
-    if coin.price_change_pct >= 20 and vol_ratio >= 2:
+    chg = coin.price_change_pct
+
+    # 0. Momentum — 2 tier:
+    #
+    #   Tier 1 (vol xác nhận): cả price lẫn vol đều mạnh → pump bền, điểm cao nhất
+    #   Tier 2 (thin air):     pump mạnh dù vol thấp hơn MA → vẫn alert, điểm thấp hơn 0.5đ
+    #   Ví dụ: VELVET +19.8% vol 0.2x, AIN +34.7% vol 0.29x, QUSDT +34% vol 0.29x
+    #          PIEVERSEUSDT +26.4% vol 1.58x → tất cả đáng alert
+
+    if chg >= 20 and vol_ratio >= 2:
         result.score_momentum = 3.0
-        details.append(f"🚀 Momentum mạnh (+{coin.price_change_pct:.1f}%)")
-    elif coin.price_change_pct >= 12 and vol_ratio >= 1.5:
+        details.append(f"🚀 Momentum mạnh (+{chg:.1f}% vol {vol_ratio:.1f}x)")
+    elif chg >= 12 and vol_ratio >= 1.5:
         result.score_momentum = 2.0
-        details.append(f"🚀 Momentum (+{coin.price_change_pct:.1f}%)")
-    elif coin.price_change_pct >= 7:
+        details.append(f"🚀 Momentum (+{chg:.1f}% vol {vol_ratio:.1f}x)")
+    elif chg >= 30:                          # thin air pump cực mạnh (≥30%)
+        result.score_momentum = 2.5
+        details.append(f"🚀 Thin-air pump cực mạnh (+{chg:.1f}%)")
+    elif chg >= 20:                          # thin air pump mạnh (20-30%)
+        result.score_momentum = 2.0
+        details.append(f"🚀 Thin-air pump (+{chg:.1f}%)")
+    elif chg >= 12:                          # thin air pump vừa (12-20%)
+        result.score_momentum = 1.5
+        details.append(f"📈 Thin-air pump vừa (+{chg:.1f}%)")
+    elif chg >= 7:
         result.score_momentum = 1.0
-        details.append(f"📈 Giá tăng (+{coin.price_change_pct:.1f}%)")
+        details.append(f"📈 Giá tăng (+{chg:.1f}%)")
 
     # 1. Cold Volume Burst
     price_near_bottom = coin.low_20d > 0 and coin.close <= coin.low_20d * (1 + BOTTOM_PCT / 100)
@@ -1147,13 +1164,21 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     elif vol_ratio >= VOL_SPIKE_MIN:
         result.score_cvb = 1.0
         details.append(f"📊 Vol Spike ({vol_ratio:.1f}x)")
+    elif vol_ratio < VOL_SPIKE_MIN and chg >= 12:
+        # Thin-air: vol thấp hơn MA nhưng pump mạnh
+        # Bù bằng OI tăng → xác nhận có lực mua thật
+        if coin.oi_change_pct >= 15:
+            result.score_cvb = 1.5
+            details.append(f"🌬️ Thin-air + OI {coin.oi_change_pct:.1f}% (vol {vol_ratio:.2f}x)")
+        elif coin.oi_change_pct >= 8:
+            result.score_cvb = 0.8
+            details.append(f"🌬️ Thin-air vol {vol_ratio:.2f}x")
 
     # 2. OI Divergence
-    abs_price_chg = abs(coin.price_change_pct)
-    if coin.oi_change_pct >= 50 and coin.oi_change_pct > abs_price_chg:
+    if coin.oi_change_pct >= 50 and coin.oi_change_pct > chg:
         result.score_oi_div = 3.0
         details.append(f"📡 OI Div cực mạnh (+{coin.oi_change_pct:.1f}%)")
-    elif coin.oi_change_pct >= OI_DIV_MIN_PCT and coin.oi_change_pct > abs_price_chg * 1.5:
+    elif coin.oi_change_pct >= OI_DIV_MIN_PCT and coin.oi_change_pct > chg * 1.5:
         result.score_oi_div = 2.0
         details.append(f"📡 OI Div mạnh (+{coin.oi_change_pct:.1f}%)")
     elif coin.oi_change_pct >= OI_DIV_MIN_PCT:
@@ -1207,6 +1232,16 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     if candle_body > 0 and upper_wick < candle_body * 0.5:
         result.total_score += 0.5
         details.append("✅ Nến đẹp")
+
+    # 7. Vol-confirmed bonus — bù khi OI thấp/không có data
+    #    Vol ≥ 2x + pump ≥ 12% mà không có OI signal = lực mua thật từ spot/market
+    #    Ví dụ: UBUSDT +15.38% vol 2.1x OI +8.5% → vừa miss, cần bonus này
+    if vol_ratio >= 2.0 and chg >= 12 and result.score_oi_div == 0:
+        result.total_score += 0.5
+        details.append(f"📊 Vol-confirmed ({vol_ratio:.1f}x) bù OI thấp")
+    elif vol_ratio >= 3.0 and chg >= 20 and result.score_oi_div <= 1.0:
+        result.total_score += 0.3
+        details.append(f"📊 Vol mạnh ({vol_ratio:.1f}x)")
 
     result.total_score += (
         result.score_momentum + result.score_cvb + result.score_oi_div + result.score_fr +
