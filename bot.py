@@ -4235,35 +4235,20 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── SCHEDULER V7.1 ───────────────────────────────────────
+        # ── SCHEDULER V7.2 FIXED ─────────────────────────────────
         # xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL
-        # mỗi 30 phút → Monitor coin đang hold: Price + CVD proxy + Funding
-        from datetime import timedelta
+        # xx:17 / xx:47 UTC → Monitor coin đang hold: Price + CVD proxy + Funding
+        # Fix: KHÔNG dùng next_hourly_slot_utc() trong loop vì dễ miss xx:02 nếu bot thức dậy sau vài giây.
+        # Logic mới check theo phút hiện tại, chạy đúng 1 lần mỗi slot.
 
         FULL_SCAN_MINUTE = 2
-        MONITOR_MINUTES = (17, 47)   # monitor riêng mỗi 30 phút, tránh trùng full scan xx:02
-        CHECK_SLEEP = 20
-
-        def _next_time_slot_utc(minutes: tuple[int, ...], now=None):
-            now = now or datetime.now(timezone.utc)
-            candidates = []
-            for m in minutes:
-                t = now.replace(minute=m, second=0, microsecond=0)
-                if t <= now:
-                    t += timedelta(hours=1)
-                candidates.append(t)
-            return min(candidates)
-
-        def next_hourly_slot_utc(now=None):
-            return _next_time_slot_utc((FULL_SCAN_MINUTE,), now)
-
-        def next_monitor_slot_utc(now=None):
-            return _next_time_slot_utc(MONITOR_MINUTES, now)
+        MONITOR_MINUTES = (17, 47)
+        CHECK_SLEEP = 10
 
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
-        log.info("⏰ SCHEDULER V7.1 khởi động")
+        log.info("⏰ SCHEDULER V7.2 FIXED khởi động")
         log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
         log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold, alert THOÁT nếu deteriorate")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
@@ -4273,53 +4258,44 @@ if __name__ == "__main__":
 
         while True:
             now = datetime.now(timezone.utc)
-            full_target = next_hourly_slot_utc(now)
-            mon_target = next_monitor_slot_utc(now)
-            target = min(full_target, mon_target)
-            wait = (target - now).total_seconds()
+            current_slot = slot_id(now)
 
-            if wait > 0:
+            # Full scan hourly — chạy 1 lần trong phút xx:02 UTC
+            if now.minute == FULL_SCAN_MINUTE and current_slot != last_full_slot:
+                last_full_slot = current_slot
+                scan_start_dt = datetime.now(timezone.utc)
+                scan_start = time.time()
+                try:
+                    log.info(f"🚀 [{scan_start_dt.strftime('%H:%M:%S UTC')}] Full scan hourly...")
+                    job()
+                except Exception as e:
+                    log.error(f"Scheduler hourly error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+                elapsed = time.time() - scan_start
+                log.info(f"✅ Full scan xong {elapsed:.0f}s")
+
+            # Monitor active trades — chạy 1 lần trong phút xx:17 và xx:47 UTC
+            if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
+                last_monitor_slot = current_slot
+                try:
+                    log.info(f"👁️ [{now.strftime('%H:%M:%S UTC')}] Monitor active trades...")
+                    monitor_active_trades()
+                except Exception as e:
+                    log.error(f"Monitor scheduler error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ [monitor] error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+
+            # Log nhẹ để biết bot còn sống, không spam mỗi 10s quá nhiều
+            if now.second < CHECK_SLEEP:
+                next_full_h = now.hour if now.minute < FULL_SCAN_MINUTE else (now.hour + 1) % 24
                 log.info(
-                    f"⏳ Đợi {wait/60:.1f}p | Full: {full_target.strftime('%H:%M UTC')} | "
-                    f"Monitor: {mon_target.strftime('%H:%M UTC')}"
+                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Full: {next_full_h:02d}:{FULL_SCAN_MINUTE:02d} UTC | "
+                    f"Monitor: xx:17 / xx:47"
                 )
-                time.sleep(min(wait, CHECK_SLEEP))
-                continue
 
-            now = datetime.now(timezone.utc)
-
-            # Full scan hourly
-            if now >= full_target:
-                current_slot = slot_id(full_target)
-                if current_slot != last_full_slot:
-                    last_full_slot = current_slot
-                    scan_start_dt = datetime.now(timezone.utc)
-                    scan_start = time.time()
-                    try:
-                        log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan hourly...")
-                        job()
-                    except Exception as e:
-                        log.error(f"Scheduler hourly error: {e}", exc_info=True)
-                        try:
-                            send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
-                        except Exception:
-                            pass
-                    elapsed = time.time() - scan_start
-                    log.info(f"✅ Full scan xong {elapsed:.0f}s")
-
-            # Monitor active trades 30m
-            if now >= mon_target:
-                current_slot = slot_id(mon_target)
-                if current_slot != last_monitor_slot:
-                    last_monitor_slot = current_slot
-                    try:
-                        log.info(f"👁️ [{now.strftime('%H:%M UTC')}] Monitor active trades...")
-                        monitor_active_trades()
-                    except Exception as e:
-                        log.error(f"Monitor scheduler error: {e}", exc_info=True)
-                        try:
-                            send_telegram(f"❌ [monitor] error: {html.escape(str(e))}")
-                        except Exception:
-                            pass
-
-            time.sleep(5)
+            time.sleep(CHECK_SLEEP)
