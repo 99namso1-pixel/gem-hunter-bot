@@ -40,6 +40,16 @@ MIN_DUMP_VOL_RATIO = 0.8               # Vol tối thiểu để xét dump (0.8 
 MIN_DUMP_PRICE_DROP = 3.0              # Drop tối thiểu 3% để lọt vào dump scan
 MIN_DUMP_SCORE = 3.0                   # Ngưỡng điểm tối thiểu để lọt top dump
 
+# ── Institutional Distribution / Post-Squeeze SHORT Engine ─────
+ENABLE_DISTRIBUTION_ENGINE = True
+MIN_DISTRIBUTION_SCORE = 5.0
+H6_BREAKDOWN_MIN_DROP = 8.0          # H6 giảm >= 8% sau blowoff = cảnh báo short
+H12_BREAKDOWN_MIN_DROP = 10.0        # H12 giảm >= 10% = cảnh báo short
+DAILY_BLOWOFF_UPPER_WICK_RATIO = 0.45 # râu trên / range ngày >= 45%
+OI_ROLLOVER_MIN_PCT = -3.0           # OI giảm >= 3% sau spike = rollover
+DEADCAT_RETRACE_MIN = 0.382          # Entry zone short: hồi 38.2% nhịp dump
+DEADCAT_RETRACE_MAX = 0.618          # Entry zone short: hồi 61.8% nhịp dump
+
 # ── 1H Reversal Engine ────────────────────────────────────────
 ENABLE_1H_REVERSAL = True              # Bật/tắt scan 1H reversal
 ENABLE_30MIN_SCAN = True               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
@@ -2384,6 +2394,183 @@ def score_coin_h2(exchange: str, symbol: str) -> Optional[ScoreResult]:
     return result
 
 
+
+def score_distribution_short(coin: CoinData) -> Optional[ScoreResult]:
+    """Institutional SHORT engine: bắt blowoff top → distribution → post-squeeze dump.
+
+    Dùng để bắt các case kiểu BILL / MLN:
+    - Nến D/H6 dump mạnh sau pump
+    - Râu trên lớn, failed continuation
+    - OI rollover / long liquidation
+    - Funding âm nhưng giá vẫn rơi = negative-funding trap
+    """
+    if not ENABLE_DISTRIBUTION_ENGINE:
+        return None
+
+    h6 = get_ohlcv_h6(coin.exchange, coin.symbol, limit=4)
+    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=3)
+    if not h6 or len(h6) < 2:
+        return None
+
+    h6_last = h6[-1]
+    h6_o = float(h6_last.get("o", 0))
+    h6_h = float(h6_last.get("h", 0))
+    h6_l = float(h6_last.get("l", 0))
+    h6_c = float(h6_last.get("c", 0))
+    if h6_o <= 0 or h6_c <= 0 or h6_h <= h6_l:
+        return None
+
+    h6_chg = (h6_c - h6_o) / h6_o * 100
+    h6_range = h6_h - h6_l
+    h6_upper_wick = h6_h - max(h6_o, h6_c)
+    h6_body = abs(h6_c - h6_o)
+
+    h12_chg = 0.0
+    if h12 and len(h12) >= 1:
+        h12_last = h12[-1]
+        h12_o = float(h12_last.get("o", 0))
+        h12_c = float(h12_last.get("c", 0))
+        if h12_o > 0:
+            h12_chg = (h12_c - h12_o) / h12_o * 100
+
+    result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    result.timeframe = "H6/D"
+    result.price_current = round(coin.close, 8)
+    result.price_chg = round(coin.price_change_pct, 2)
+    result.oi_chg_pct = round(coin.oi_change_pct, 1)
+    result.fr = round(coin.funding_rate * 100, 4)
+    result.lsr = round(coin.lsr, 4)
+    result.vol_ratio = round((coin.volume / coin.vol_ma10), 2) if coin.vol_ma10 > 0 else 0
+
+    score = 0.0
+    details = []
+
+    # 1) H6 breakdown sau blowoff
+    if h6_chg <= -15:
+        score += 3.0
+        details.append(f"H6 dump mạnh {h6_chg:.1f}%")
+    elif h6_chg <= -H6_BREAKDOWN_MIN_DROP:
+        score += 2.0
+        details.append(f"H6 breakdown {h6_chg:.1f}%")
+
+    # 2) H12 cũng đỏ = momentum short có xác nhận MTF
+    if h12_chg <= -H12_BREAKDOWN_MIN_DROP:
+        score += 2.0
+        details.append(f"H12 breakdown {h12_chg:.1f}%")
+    elif h12_chg <= -5:
+        score += 1.0
+        details.append(f"H12 yếu {h12_chg:.1f}%")
+
+    # 3) Daily blowoff / failed continuation: râu trên lớn hoặc ngày đang dump mạnh
+    d_range = coin.high - coin.low
+    if d_range > 0:
+        d_upper = coin.high - max(coin.open, coin.close)
+        upper_ratio = d_upper / d_range
+        if upper_ratio >= DAILY_BLOWOFF_UPPER_WICK_RATIO and coin.price_change_pct < 0:
+            score += 2.0
+            details.append("Daily failed continuation")
+        elif coin.price_change_pct <= -12:
+            score += 2.0
+            details.append(f"Daily dump {coin.price_change_pct:.1f}%")
+        elif coin.price_change_pct <= -7:
+            score += 1.0
+            details.append(f"Daily yếu {coin.price_change_pct:.1f}%")
+
+    # 4) OI rollover / longs bị unwind
+    if coin.oi_change_pct <= -10:
+        score += 2.0
+        details.append(f"OI rollover {coin.oi_change_pct:.1f}%")
+    elif coin.oi_change_pct <= OI_ROLLOVER_MIN_PCT:
+        score += 1.0
+        details.append(f"OI giảm {coin.oi_change_pct:.1f}%")
+
+    # 5) Funding âm nhưng giá vẫn rơi = không còn squeeze continuation, dễ là trap long
+    fr_pct = coin.funding_rate * 100
+    if fr_pct < -0.01 and (h6_chg < 0 or coin.price_change_pct < 0):
+        score += 1.0
+        details.append(f"FR âm trap {fr_pct:.3f}%")
+    elif fr_pct > 0.05 and (h6_chg < 0 or coin.price_change_pct < 0):
+        score += 1.0
+        details.append(f"Long crowded FR {fr_pct:.3f}%")
+
+    # 6) Volume xác nhận panic/distribution
+    if coin.vol_ma10 > 0:
+        vr = coin.volume / coin.vol_ma10
+        if vr >= 3 and coin.price_change_pct < 0:
+            score += 2.0
+            details.append(f"Panic volume {vr:.1f}x")
+        elif vr >= 1.5 and coin.price_change_pct < 0:
+            score += 1.0
+            details.append(f"Volume xác nhận {vr:.1f}x")
+
+    # 7) Nến H6 reject / râu trên lớn
+    if h6_body > 0 and h6_upper_wick > h6_body * 1.2:
+        score += 1.0
+        details.append("H6 rejection wick")
+
+    # 8) Liquidation: longs bị liquidate nhiều hơn shorts
+    if coin.liq_longs > 0 and coin.liq_shorts > 0:
+        long_liq_ratio = coin.liq_longs / max(coin.liq_shorts, 1)
+        if long_liq_ratio >= 3:
+            score += 1.5
+            details.append(f"Long liq {long_liq_ratio:.1f}x")
+        elif long_liq_ratio >= 1.5:
+            score += 0.8
+            details.append(f"Long liq {long_liq_ratio:.1f}x")
+
+    result.total_score = round(score, 1)
+    if result.total_score < MIN_DISTRIBUTION_SCORE:
+        return None
+
+    result.signal_type = "KHUYẾN NGHỊ SHORT"
+    result.market_mode = "DISTRIBUTION_SHORT"
+    result.reversal_type = "DISTRIBUTION_SHORT"
+    result.details = details
+
+    # ===== Entry/SL/TP cụ thể =====
+    # Entry short tốt nhất là dead-cat bounce về 38.2-61.8% của nến breakdown H6.
+    # Nếu range H6 quá nhỏ thì fallback sang daily range.
+    swing_high = h6_h
+    swing_low = h6_l
+    if (swing_high - swing_low) / max(h6_c, 1e-12) < 0.03 and d_range > 0:
+        swing_high = coin.high
+        swing_low = coin.low
+
+    move = swing_high - swing_low
+    entry_low = swing_low + move * DEADCAT_RETRACE_MIN
+    entry_high = swing_low + move * DEADCAT_RETRACE_MAX
+    entry_mid = (entry_low + entry_high) / 2
+
+    # SL trên swing high, thêm buffer 1.5%
+    sl = swing_high * 1.015
+
+    # TP theo liquidity dưới đáy breakdown
+    tp1 = swing_low * 0.985
+    tp2 = swing_low * 0.94
+    tp3 = swing_low * 0.88
+
+    result.entry = _smart_round(entry_mid)
+    result.sl = _smart_round(sl)
+    result.tp1 = _smart_round(tp1)
+    result.tp2 = _smart_round(tp2)
+    result.tp3 = _smart_round(tp3)
+
+    risk = abs(result.sl - result.entry)
+    if risk > 0:
+        result.rr_tp1 = round(abs(result.entry - result.tp1) / risk, 2)
+        result.rr_tp2 = round(abs(result.entry - result.tp2) / risk, 2)
+
+    return result
+
+
+def _smart_round(v: float) -> float:
+    """Round giá theo số chữ số phù hợp với coin nhỏ/lớn."""
+    import math
+    if v <= 0:
+        return 0.0
+    digits = max(2, -int(math.floor(math.log10(abs(v)))) + 4)
+    return round(v, digits)
+
 def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     Optional[ScoreResult], Optional[ScoreResult], Optional[ScoreResult]
 ]:
@@ -2393,6 +2580,9 @@ def scan_one_symbol(exchange: str, symbol: str) -> tuple[
         return None, None, None
     pump = score_coin_pump(coin)
     dump = score_coin_dump(coin)
+    dist = score_distribution_short(coin)
+    if dist and (dump is None or dist.total_score >= dump.total_score):
+        dump = dist
     # Lấy signal tốt nhất: reversal hoặc h1_breakout
     rev1 = score_reversal(coin)
     rev2 = score_h1_breakout(coin)
@@ -2643,7 +2833,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
-                f"{mode_icon} <b>{signal}</b>\n"
+                f"🟢 <b>KHUYẾN NGHỊ LONG</b>\n"
                 f"💰 Giá: <b>{r.price_current:.6g}</b> | +{r.price_chg:.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
@@ -2680,7 +2870,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
-                f"📉 <b>{signal}</b>\n"
+                f"🔻 <b>KHUYẾN NGHỊ SHORT</b>\n"
                 f"💰 Giá: <b>{r.price_current:.6g}</b> | {r.price_chg:.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
