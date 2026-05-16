@@ -71,6 +71,14 @@ REVERSAL_TOP_PER_SIDE = 1
 REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2}
 REVERSAL_PRIORITY_SCORE_BONUS = 0.25
 
+# ── Downtrend Macro Filter cho Reversal Engine ────────────────
+# Nếu coin đang trong downtrend kéo dài thì bounce = dead cat nhiều hơn reversal thật
+# → Cap score để tránh SKYAI/RUNE case (7D -27% được điểm cao)
+REVERSAL_DOWNTREND_HARD_CAP_PCT  = -30.0   # 7D < -30% → SKIP hoàn toàn (downtrend cực mạnh)
+REVERSAL_DOWNTREND_SCORE_CAP_PCT = -20.0   # 7D < -20% → Cap score tối đa 7.0đ
+REVERSAL_DOWNTREND_SCORE_CAP     =  7.0    # Score cap khi 7D quá xấu
+REVERSAL_UPTREND_BONUS_PCT       =  10.0   # 7D > +10% = uptrend macro → bonus +0.5đ
+
 # ── H2 Scan config ────────────────────────────────────────────
 H2_MIN_CHG      = 7.0    # H2 tăng/giảm tối thiểu 7%
 H2_MIN_VOL      = 1.3    # vol_ratio H2 tối thiểu (thấp hơn D vì H2 vol hay thấp)
@@ -93,12 +101,13 @@ HYBRID_MIN_SCORE = 5.0                  # Cả trend + squeeze đều mạnh
 # Tăng tốc scan
 FAST_SCAN = True
 MAX_WORKERS_BINANCE = 12   # Giữ — Binance weight-based, 12 là sweet spot
-MAX_WORKERS_BYBIT  = 15   # Bybit limit 120 req/s, còn dư nhiều
-MAX_WORKERS_BINGX  = 6    # BingX limit 10 req/s thực tế
-MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
+MAX_WORKERS_BYBIT   = 6    # Giảm 15→6: tránh 403 rate limit Bybit
+MAX_WORKERS_BINGX   = 6    # BingX limit 10 req/s thực tế
+MAX_WORKERS_KUCOIN  = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
+BYBIT_REQUEST_DELAY  = 0.12  # 120ms delay giữa Bybit requests → ~8 req/s, tránh 403
 
-# Số workers tối đa cho parallel exchange scan (3 sàn chạy đồng thời)
+# Số workers tối đa cho parallel exchange scan
 MAX_WORKERS_EXCHANGES = 2  # Chạy Binance + Bybit song song
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
 
@@ -123,6 +132,11 @@ KUCOIN_BASE = "https://api-futures.kucoin.com"   # KuCoin Futures public API
 # Rate limiter cho KuCoin — semaphore + delay để tránh 429
 import threading as _threading
 _kucoin_lock = _threading.Semaphore(MAX_WORKERS_KUCOIN)
+
+# Rate limiter cho Bybit — tránh 403 khi scan nhiều coin song song
+_bybit_lock  = _threading.Semaphore(MAX_WORKERS_BYBIT)
+_bybit_last_request = 0.0
+_bybit_lock_mu = _threading.Lock()
 
 CG_HEADERS = {
     "accept": "application/json",
@@ -174,6 +188,8 @@ class CoinData:
     prev2d_change_pct: float = 0   # nến[-3]: hôm kia
     # Intraday dump: (open - low) / open — bắt case dump sâu trong ngày rồi bật lại
     intraday_dump_pct: float = 0   # % giá đã dump từ open xuống low trong nến ngày hiện tại
+    # 7D performance — dùng để detect downtrend macro (RUNE/SKYAI case)
+    change_7d: float = 0           # % thay đổi 7 ngày qua (tính từ 7 nến 1D)
     # 1H Reversal data
     h1_open: float = 0
     h1_close: float = 0
@@ -234,6 +250,9 @@ class ScoreResult:
     rr_tp1: float = 0           # Risk:Reward tới TP1
     rr_tp2: float = 0           # Risk:Reward tới TP2
     details: list = field(default_factory=list)
+    # Fibonacci dead-cat bounce entry cho DUMP signal
+    entry_limit: float = 0      # Entry limit tại Fib 38.2%-50% bounce (dump signal)
+    fib_entry_pct: float = 0    # % retracement entry limit so với dump range
 
     @property
     def display_symbol(self) -> str:
@@ -289,13 +308,45 @@ def bingx_get(endpoint: str, params: dict | None = None) -> Optional[dict]:
     return None
 
 def bybit_get(endpoint: str, params: dict | None = None) -> Optional[dict]:
-    data = http_get(f"{BYBIT_BASE}{endpoint}", params=params or {})
-    if not data:
+    """Bybit API với rate limit tự động — tránh 403 khi scan nhiều coin song song."""
+    global _bybit_last_request
+
+    with _bybit_lock:
+        # Enforce minimum delay giữa các request
+        with _bybit_lock_mu:
+            now = time.time()
+            elapsed = now - _bybit_last_request
+            if elapsed < BYBIT_REQUEST_DELAY:
+                time.sleep(BYBIT_REQUEST_DELAY - elapsed)
+            _bybit_last_request = time.time()
+
+        url = f"{BYBIT_BASE}{endpoint}"
+        for attempt in range(3):
+            try:
+                r = get_session().get(url, params=params or {}, timeout=15)
+                if r.status_code == 403:
+                    # Rate limited — backoff exponential
+                    wait = 2.0 * (attempt + 1)
+                    log.debug(f"Bybit 403 {endpoint} — backoff {wait:.1f}s (attempt {attempt+1}/3)")
+                    time.sleep(wait)
+                    continue
+                if r.status_code == 429:
+                    wait = 5.0 * (attempt + 1)
+                    log.warning(f"Bybit 429 rate limit {endpoint} — backoff {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                if data.get("retCode") == 0:
+                    return data.get("result", {})
+                log.debug(f"Bybit API error {endpoint}: {data.get('retMsg', 'unknown')}")
+                return None
+            except requests.RequestException as e:
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    log.debug(f"Bybit GET failed {endpoint}: {e}")
         return None
-    if data.get("retCode") == 0:
-        return data.get("result", {})
-    log.warning(f"Bybit API error {endpoint}: {data.get('retMsg', 'unknown')}")
-    return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1028,9 +1079,15 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
             coin.prev2d_change_pct = (c2c - o2) / o2 * 100
 
     # Intraday dump depth: (open - low) / open — nến ngày hiện tại
-    # Case MLNUSDT: open=3.157, low=2.073 → dump 34.3% trong ngày dù close chưa phản ánh hết
     if coin.open > 0 and coin.low > 0:
         coin.intraday_dump_pct = (coin.open - coin.low) / coin.open * 100
+
+    # 7D performance — so sánh close hiện tại vs close 7 nến trước
+    if len(candles) >= 8:
+        c7 = candles[-8]   # nến 7 ngày trước
+        close_7d_ago = float(c7.get("c", 0))
+        if close_7d_ago > 0 and coin.close > 0:
+            coin.change_7d = (coin.close - close_7d_ago) / close_7d_ago * 100
     prev_vols = [float(c.get("v", 0)) for c in candles[-11:-1]]
     coin.vol_ma10 = sum(prev_vols) / len(prev_vols) if prev_vols else 0
 
@@ -1194,7 +1251,14 @@ def classify_market_mode(result: ScoreResult, coin: CoinData, vol_ratio: float) 
         result.total_score += 0.4
 
 def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
-    """Tính Entry/SL/TP cho pump/dump từ range nến D."""
+    """
+    Tính Entry/SL/TP cho pump/dump từ range nến D.
+
+    DUMP signal: dùng Fibonacci retracement để tính entry limit tốt hơn
+    - Nếu giá dump mạnh trong ngày → chờ bounce 38.2%-50% rồi short
+    - Entry limit tại Fib 38.2% của range ngày
+    - R:R đẹp hơn entry ngay tại giá hiện tại
+    """
     import math
     d_range = coin.high - coin.low
     if d_range <= 0 or coin.close <= 0:
@@ -1213,11 +1277,48 @@ def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
         result.tp1 = fmt(entry + d_range * 0.5)
         result.tp2 = fmt(entry + d_range * 1.0)
         result.tp3 = fmt(entry + d_range * 1.618)
-    else:  # DUMP
+
+    else:  # DUMP — thêm Fibonacci dead-cat bounce entry
+        # SL trên đỉnh ngày + buffer
         result.sl  = fmt(coin.high + d_range * 0.1)
-        result.tp1 = fmt(entry - d_range * 0.5)
-        result.tp2 = fmt(entry - d_range * 1.0)
-        result.tp3 = fmt(entry - d_range * 1.618)
+
+        # ── Fibonacci Dead-Cat Bounce Entry ──────────────────────
+        # Nếu dump sâu (>10% trong ngày) → tính entry limit tại bounce
+        drop_pct = abs(coin.price_change_pct)
+        fib_382 = coin.low + d_range * 0.382  # Bounce 38.2% từ đáy
+        fib_500 = coin.low + d_range * 0.500  # Bounce 50%
+        fib_618 = coin.low + d_range * 0.618  # Bounce 61.8%
+
+        if drop_pct >= 15:
+            # Dump rất mạnh → chờ bounce 38.2% để short
+            # Entry limit tại Fib 38.2%, đây là vùng resistance đầu tiên
+            result.entry       = fmt(entry)          # Entry Now = giá hiện tại (aggressive)
+            result.entry_limit = fmt(fib_382)        # Entry Limit = chờ bounce 38.2%
+            result.sl          = fmt(fib_618 + d_range * 0.05)  # SL trên Fib 61.8%
+            # TP tính từ entry_limit
+            short_entry = fib_382
+            short_risk  = result.sl - short_entry
+            result.tp1  = fmt(short_entry - short_risk * 1.5)
+            result.tp2  = fmt(short_entry - short_risk * 2.5)
+            result.tp3  = fmt(short_entry - short_risk * 4.0)
+
+        elif drop_pct >= 8:
+            # Dump vừa → entry limit tại 50% retracement
+            result.entry       = fmt(entry)
+            result.entry_limit = fmt(fib_500)
+            result.sl          = fmt(coin.high + d_range * 0.05)
+            short_entry = fib_500
+            short_risk  = result.sl - short_entry
+            result.tp1  = fmt(short_entry - short_risk * 1.5)
+            result.tp2  = fmt(short_entry - short_risk * 2.5)
+            result.tp3  = fmt(short_entry - short_risk * 3.5)
+
+        else:
+            # Dump nhỏ → entry ngay như cũ
+            result.entry_limit = fmt(entry)
+            result.tp1 = fmt(entry - d_range * 0.5)
+            result.tp2 = fmt(entry - d_range * 1.0)
+            result.tp3 = fmt(entry - d_range * 1.618)
 
 
 def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
@@ -1748,6 +1849,20 @@ def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
     if not is_pump_rev and not is_dump_rev:
         return None
 
+    # ── DOWNTREND MACRO FILTER ────────────────────────────────────
+    # RUNE case: 7D -27% được 10.5đ → dead cat bounce, không phải reversal thật
+    change_7d = coin.change_7d   # % 7 ngày qua
+
+    if is_dump_rev:
+        # Skip hoàn toàn nếu downtrend quá mạnh
+        if change_7d <= REVERSAL_DOWNTREND_HARD_CAP_PCT:
+            log.debug(
+                f"[REV_FILTER] SKIP {coin.symbol} DUMP_REV: "
+                f"7D={change_7d:.1f}% < {REVERSAL_DOWNTREND_HARD_CAP_PCT}% — downtrend cực mạnh"
+            )
+            return None
+    # ─────────────────────────────────────────────────────────────
+
     if is_pump_rev:
         result.reversal_type = "PUMP_REVERSAL"
         result.market_mode   = "PUMP_REVERSAL"
@@ -1896,6 +2011,22 @@ def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
 
     result.total_score = round(score, 1)
     result.details     = details
+
+    # ── DOWNTREND SCORE CAP ───────────────────────────────────────
+    if result.reversal_type == "DUMP_REVERSAL":
+        if change_7d <= REVERSAL_DOWNTREND_SCORE_CAP_PCT:
+            if result.total_score > REVERSAL_DOWNTREND_SCORE_CAP:
+                original = result.total_score
+                result.total_score = REVERSAL_DOWNTREND_SCORE_CAP
+                result.details.append(
+                    f"⚠️ Score giới hạn {REVERSAL_DOWNTREND_SCORE_CAP}đ "
+                    f"(từ {original}đ) — 7D={change_7d:.1f}% downtrend macro"
+                )
+        elif change_7d >= REVERSAL_UPTREND_BONUS_PCT:
+            # Uptrend macro = bounce có xác suất cao hơn
+            result.total_score = round(result.total_score + 0.5, 1)
+            result.details.append(f"✅ 7D uptrend macro (+{change_7d:.1f}%) — bonus +0.5đ")
+    # ─────────────────────────────────────────────────────────────
 
     if result.total_score < MIN_REVERSAL_SCORE:
         return None
@@ -2817,26 +2948,50 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
         return f"{(t - e) / e * 100:+.2f}%"
 
     def entry_block(r: ScoreResult, side: str) -> str:
-        """Tách Entry Now / Entry Limit.
-        - Entry Now = giá hiện tại, chỉ OK nếu không lệch quá xa ideal entry.
-        - Entry Limit = entry chiến lược/retest.
         """
-        current = r.price_current or 0
+        Tách Entry Now / Entry Limit.
+        - DUMP signal với Fib: chỉ hiện Entry Limit (chờ bounce), bỏ Entry Now
+        - PUMP / DUMP nhỏ: hiện Entry Now + Entry Limit
+        """
+        current     = r.price_current or 0
         limit_entry = r.entry or current
-        dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
 
+        # DUMP với Fib entry — chỉ hiện Entry Limit, không có Entry Now
+        fib_limit = getattr(r, "entry_limit", 0)
+        use_fib   = (side == "SHORT" and fib_limit > 0 and fib_limit != limit_entry)
+
+        if use_fib:
+            drop_pct = abs(r.price_chg) if r.price_chg else 0
+            if drop_pct >= 15:
+                fib_label = "Fib 38.2%"
+            elif drop_pct >= 8:
+                fib_label = "Fib 50%"
+            else:
+                fib_label = "Entry Limit"
+
+            rr_display = ""
+            if fib_limit > 0 and r.sl > 0 and r.tp1 > 0:
+                risk   = abs(r.sl - fib_limit)
+                reward = abs(fib_limit - r.tp1)
+                if risk > 0:
+                    rr = reward / risk
+                    rr_display = f" | R:R <b>1:{rr:.1f}</b>"
+
+            # Không có Entry Now — chỉ hiện limit entry
+            return (
+                f"📍 Entry Limit ({fib_label}): <b>{fmt_price(fib_limit)}</b> | "
+                f"SL: <b>{fmt_price(r.sl)}</b>{rr_display}"
+            )
+
+        # PUMP hoặc DUMP nhỏ — logic cũ: Entry Now + Entry Limit
+        dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
         now_line = f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
         if dist_pct > 3.0:
             now_line = f"⚡ Entry Now: <b>Không chase</b>"
 
-        if side == "LONG":
-            limit_label = "🎯 Entry Limit"
-        else:
-            limit_label = "🎯 Entry Limit"
-
         return (
             f"{now_line}\n"
-            f"{limit_label}: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
+            f"📍 Entry Limit: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
         )
 
     # ── PUMP SECTION: chỉ hiện khi có kết quả ───────────────────
@@ -2896,11 +3051,14 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                 f"💰 Giá: <b>{fmt_price(r.price_current)}</b> | {r.price_chg:.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
+                # Dùng entry_limit (Fib) làm reference cho TP% nếu có
+                fib_e = getattr(r, "entry_limit", 0)
+                tp_ref = fib_e if fib_e > 0 and fib_e != r.entry else r.entry
                 lines.append(
                     f"{entry_block(r, 'SHORT')}\n"
-                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
-                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
-                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, tp_ref)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, tp_ref)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, tp_ref)})"
                 )
             lines.append("")
 
@@ -3133,8 +3291,20 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
                 return ""
             return f"{(target - entry) / entry * 100:+.2f}%"
 
+        # 7D context line
+        change_7d_val = getattr(r, '_change_7d_display', 0)
+        # Lấy từ details nếu có
+        cap_note = ""
+        for d in (r.details or []):
+            if "Score giới hạn" in d:
+                cap_note = f" ⚠️ capped"
+                break
+            if "7D uptrend" in d:
+                cap_note = f" ✅ macro up"
+                break
+
         lines.append(
-            f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{cap_note}\n"
             f"{side_line}\n"
             f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}% | M30: {r.m30_chg:+.2f}%"
         )
@@ -4011,11 +4181,16 @@ def job():
 ACTIVE_TRADES_FILE = "active_trades.json"
 MONITOR_INTERVAL_MINUTES = 30
 MONITOR_PRICE_ADVERSE_PCT = 1.5       # Giá đi ngược entry 1.5% thì cảnh báo thoát sớm
-MONITOR_CVD_BARS = 3                  # Dùng 3 nến M30 gần nhất để làm CVD proxy
-MONITOR_CVD_BEARISH_BARS = 2          # LONG: >=2/3 nến signed volume âm = xấu
-MONITOR_CVD_BULLISH_BARS = 2          # SHORT: >=2/3 nến signed volume dương = xấu
+MONITOR_CVD_BARS = 5                  # Tăng 3→5: dùng 5 nến M30 để giảm false positive
+MONITOR_CVD_BEARISH_BARS = 4          # LONG: cần >=4/5 nến âm (tăng từ 2/3) mới exit
+MONITOR_CVD_BULLISH_BARS = 4          # SHORT: cần >=4/5 nến dương (tăng từ 2/3) mới exit
 MONITOR_FUNDING_LONG_MAX = 0.08       # LONG: funding > 0.08% = crowded long, xấu
 MONITOR_FUNDING_SHORT_MIN = -0.08     # SHORT: funding < -0.08% = crowded short, xấu
+# Thêm: L/S ratio override — nếu L/S xác nhận chiều trade thì không thoát dù CVD xấu
+MONITOR_LSR_SHORT_OVERRIDE = 0.85    # SHORT: nếu L/S < 0.85 (sellers dominant) → bỏ qua CVD xấu
+MONITOR_LSR_LONG_OVERRIDE  = 1.20    # LONG: nếu L/S > 1.20 (buyers dominant) → bỏ qua CVD xấu
+# Thêm: chỉ thoát SHORT khi CVD xấu VÀ funding cũng xấu (cần 2 tín hiệu)
+MONITOR_REQUIRE_MULTI_SIGNAL = True  # True = CVD xấu đơn lẻ không đủ để thoát
 
 
 def _active_trade_key(exchange: str, symbol: str, side: str) -> str:
@@ -4145,24 +4320,63 @@ def monitor_active_trades() -> None:
             cvd_proxy, bull_bars, bear_bars = _signed_cvd_proxy(candles, MONITOR_CVD_BARS)
             pnl_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
 
+            # Fetch L/S ratio để cross-check — tránh false positive
+            lsr_now = 0.0
+            try:
+                lsr_now = get_lsr(exchange, symbol) or 0.0
+            except Exception:
+                pass
+
             reasons = []
             if side == "LONG":
                 if sl > 0 and price <= sl:
                     reasons.append("giá chạm/vượt SL")
                 if price <= entry * (1 - MONITOR_PRICE_ADVERSE_PCT / 100):
                     reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
-                if bear_bars >= MONITOR_CVD_BEARISH_BARS and cvd_proxy < 0:
-                    reasons.append("CVD M30 proxy xấu")
-                if funding_pct >= MONITOR_FUNDING_LONG_MAX:
+
+                # CVD xấu cho LONG
+                cvd_bearish = (bear_bars >= MONITOR_CVD_BEARISH_BARS and cvd_proxy < 0)
+                if cvd_bearish:
+                    # Override: nếu L/S buyers vẫn dominant → bỏ qua CVD
+                    lsr_confirms_long = (lsr_now >= MONITOR_LSR_LONG_OVERRIDE)
+                    if lsr_confirms_long:
+                        log.info(f"  ↳ {symbol} LONG: CVD xấu nhưng L/S={lsr_now:.3f} buyers dominant → giữ")
+                    elif MONITOR_REQUIRE_MULTI_SIGNAL:
+                        # Cần thêm 1 signal nữa mới thoát
+                        if funding_pct >= MONITOR_FUNDING_LONG_MAX:
+                            reasons.append(f"CVD xấu + funding dương {funding_pct:.4f}%")
+                        # Hoặc giá cũng đang đi ngược
+                        elif price < entry * 0.99:
+                            reasons.append("CVD xấu + giá dưới entry")
+                    else:
+                        reasons.append("CVD M30 proxy xấu")
+
+                if funding_pct >= MONITOR_FUNDING_LONG_MAX and "CVD" not in " ".join(reasons):
                     reasons.append(f"funding quá dương {funding_pct:.4f}%")
-            else:
+
+            else:  # SHORT
                 if sl > 0 and price >= sl:
                     reasons.append("giá chạm/vượt SL")
                 if price >= entry * (1 + MONITOR_PRICE_ADVERSE_PCT / 100):
                     reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
-                if bull_bars >= MONITOR_CVD_BULLISH_BARS and cvd_proxy > 0:
-                    reasons.append("CVD M30 proxy xấu")
-                if funding_pct <= MONITOR_FUNDING_SHORT_MIN:
+
+                # CVD xấu cho SHORT
+                cvd_bullish = (bull_bars >= MONITOR_CVD_BULLISH_BARS and cvd_proxy > 0)
+                if cvd_bullish:
+                    # Override: nếu L/S sellers vẫn dominant → bỏ qua CVD
+                    lsr_confirms_short = (lsr_now > 0 and lsr_now <= MONITOR_LSR_SHORT_OVERRIDE)
+                    if lsr_confirms_short:
+                        log.info(f"  ↳ {symbol} SHORT: CVD xấu nhưng L/S={lsr_now:.3f} sellers dominant → giữ")
+                    elif MONITOR_REQUIRE_MULTI_SIGNAL:
+                        # Cần thêm 1 signal nữa mới thoát
+                        if funding_pct <= MONITOR_FUNDING_SHORT_MIN:
+                            reasons.append(f"CVD xấu + funding âm {funding_pct:.4f}%")
+                        elif price > entry * 1.01:
+                            reasons.append("CVD xấu + giá trên entry")
+                    else:
+                        reasons.append("CVD M30 proxy xấu")
+
+                if funding_pct <= MONITOR_FUNDING_SHORT_MIN and "CVD" not in " ".join(reasons):
                     reasons.append(f"funding quá âm {funding_pct:.4f}%")
 
             t["last_check"] = datetime.now(timezone.utc).isoformat()
@@ -4174,12 +4388,21 @@ def monitor_active_trades() -> None:
                 t["exit_alerted"] = True
                 changed = True
                 side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
+                lsr_str = f"{lsr_now:.3f}" if lsr_now > 0 else "N/A"
                 exit_blocks.append(
                     f"🚨 <b>THOÁT NGAY</b>\n"
                     f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
                     f"Entry: <b>{entry:.6g}</b> | Giá: <b>{price:.6g}</b> | PnL: <b>{pnl_pct:+.2f}%</b>\n"
-                    f"SL: <b>{sl:.6g}</b> | Funding: <b>{funding_pct:.4f}%</b>\n"
+                    f"SL: <b>{sl:.6g}</b> | Funding: <b>{funding_pct:.4f}%</b> | L/S: <b>{lsr_str}</b>\n"
                     f"Lý do: {html.escape(', '.join(reasons))}"
+                )
+            else:
+                # Log trạng thái hold tốt để dễ theo dõi
+                lsr_str = f"{lsr_now:.3f}" if lsr_now > 0 else "N/A"
+                log.info(
+                    f"  ✅ {symbol} {side}: PnL={pnl_pct:+.2f}% | "
+                    f"FR={funding_pct:.4f}% | L/S={lsr_str} | "
+                    f"CVD bull={bull_bars}/bear={bear_bars}"
                 )
         except Exception as e:
             log.debug(f"Monitor lỗi {key}: {e}")
