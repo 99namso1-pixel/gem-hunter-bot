@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║  CRYPTO PUMP & DUMP SCANNER BOT V5                          ║
-║  Quét USDT Perp: Binance, Bybit, BingX, KuCoin               ║
+║  Quét USDT Perp: Binance, Bybit, BingX                       ║
 ║  1D Trend/Squeeze + 1H Reversal Engine → Telegram           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -27,7 +27,7 @@ from config import (
 )
 
 # Có thể sửa nhanh tại đây
-SCAN_EXCHANGES = ["Binance", "Bybit", "BingX", "KuCoin"]  # Quét cả 4 sàn
+SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Quét 3 sàn, bỏ KuCoin để tránh lệch symbol/giá USDTM
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
@@ -82,8 +82,8 @@ MAX_WORKERS_BINGX  = 6    # BingX limit 10 req/s thực tế
 MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
 
-# Số workers tối đa cho parallel exchange scan (4 sàn chạy đồng thời)
-MAX_WORKERS_EXCHANGES = 4  # Chạy Binance + Bybit + BingX + KuCoin song song
+# Số workers tối đa cho parallel exchange scan (3 sàn chạy đồng thời)
+MAX_WORKERS_EXCHANGES = 3  # Chạy Binance + Bybit + BingX song song
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
 
 # ── Logging ──────────────────────────────────────────────────
@@ -1390,6 +1390,7 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
         return None
     calc_pump_tp_sl(result, coin)
     return result
+def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
     """Score coin tiềm năng DUMP (nến đỏ, momentum giảm mạnh)."""
     # Chỉ xét nến đỏ cho DUMP
     if coin.close >= coin.open:
@@ -2471,10 +2472,10 @@ def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResul
 
 def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     """
-    Quét cả 4 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
+    Quét 3 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
 
     Kiến trúc parallel 2 tầng:
-      Tầng 1: 4 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=4)
+      Tầng 1: 3 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=3)
       Tầng 2: Mỗi sàn scan symbol của mình song song (workers riêng từng sàn)
 
     Quy tắc PUMP: SQUEEZE ưu tiên TOP 1, còn lại theo total_score.
@@ -2491,7 +2492,7 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     scan_start = time.time()
     log.info(f"🚀 Parallel scan bắt đầu: {len(SCAN_EXCHANGES)} sàn đồng thời...")
 
-    # Tầng 1: 4 sàn chạy song song
+    # Tầng 1: 3 sàn chạy song song
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
         future_map = {
             ex_pool.submit(run_scan_exchange, exchange): exchange
@@ -2764,7 +2765,7 @@ def save_results(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 def run_reversal_scan() -> list[ScoreResult]:
     """
     Chỉ scan Reversal (1H) — dùng cho job 30 phút.
-    4 sàn chạy SONG SONG, dedup, trả về top 1 mỗi loại.
+    3 sàn chạy SONG SONG, dedup, trả về top 1 mỗi loại.
     """
     all_rev: list[ScoreResult] = []
     scan_start = time.time()
@@ -2795,7 +2796,7 @@ def run_reversal_scan() -> list[ScoreResult]:
         log.info(f"✅ {exchange} reversal xong: {len(results)} signals | {time.time()-scan_start:.0f}s")
         return results
 
-    # 4 sàn song song
+    # 3 sàn song song
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
         futures = {ex_pool.submit(_scan_exchange_reversal, ex): ex for ex in SCAN_EXCHANGES}
         for future in as_completed(futures):
@@ -2986,6 +2987,12 @@ class MTFResult:
     # Tổng
     mtf_score:   float = 0
     green_count: int   = 0   # Số khung xanh / 3
+    # Institutional / SMC-style score
+    inst_score: float = 0
+    final_score: float = 0
+    bias: str = "NEUTRAL"
+    trade_quality: str = "NO TRADE"
+    inst_notes: list = field(default_factory=list)
     signal_type: str   = ""
     direction:   str   = "PUMP"
 
@@ -2996,6 +3003,147 @@ class MTFResult:
         if s.endswith("USDT"):  return s[:-4]
         return s
 
+
+
+def _pct_change(o: float, c: float) -> float:
+    return (c - o) / o * 100 if o > 0 else 0.0
+
+
+def _wick_profile(o: float, h: float, l: float, c: float) -> tuple[float, float, float]:
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return body / rng, upper / rng, lower / rng
+
+
+def _institutional_mtf_score(result: MTFResult, candles_d: list, candles_h12: Optional[list], candles_h6: Optional[list],
+                             d_vr: float, funding_rate: float = 0.0, oi_change_pct: float = 0.0,
+                             lsr: float = 0.0, liq_longs: float = 0.0, liq_shorts: float = 0.0) -> None:
+    """
+    Institutional / SMC-style daily selector.
+    Mục tiêu: chọn coin có setup giống phân tích thủ công:
+    - Structure đa khung rõ (D/H12/H6 cùng bias)
+    - Compression -> Expansion
+    - Sweep/reclaim hoặc breakout acceptance
+    - Futures sạch: funding chưa crowded, OI xác nhận, L/S không quá lệch
+    - Né trap: wick xả, funding nóng, OI tăng nhưng giá không chạy
+    """
+    notes: list[str] = []
+    score = 0.0
+    direction = result.direction
+
+    d = candles_d[-1]
+    d_o, d_h, d_l, d_c = map(lambda k: float(d.get(k, 0)), ["o", "h", "l", "c"])
+    body_pct, upper_wick_pct, lower_wick_pct = _wick_profile(d_o, d_h, d_l, d_c)
+    d_chg = _pct_change(d_o, d_c)
+
+    # ── 1. Market Structure D/H12/H6 ───────────────────────────
+    if result.green_count == 3:
+        score += 2.0
+        notes.append("MTF 3/3 cùng chiều")
+    elif result.green_count == 2:
+        score += 1.0
+        notes.append("MTF 2/3 cùng chiều")
+
+    # Higher-low / lower-high proxy từ 5 nến D gần nhất
+    if len(candles_d) >= 6:
+        lows = [float(x.get("l", 0)) for x in candles_d[-6:]]
+        highs = [float(x.get("h", 0)) for x in candles_d[-6:]]
+        if direction == "PUMP":
+            if lows[-1] >= min(lows[-4:-1]) and d_c > sum(float(x.get("c", 0)) for x in candles_d[-4:-1]) / 3:
+                score += 1.0; notes.append("HL/reclaim structure")
+            if d_c > max(highs[-4:-1]):
+                score += 1.2; notes.append("BOS breakout D")
+        else:
+            if highs[-1] <= max(highs[-4:-1]) and d_c < sum(float(x.get("c", 0)) for x in candles_d[-4:-1]) / 3:
+                score += 1.0; notes.append("LH/reject structure")
+            if d_c < min(lows[-4:-1]):
+                score += 1.2; notes.append("BOS breakdown D")
+
+    # ── 2. Liquidity sweep / reclaim proxy ─────────────────────
+    if len(candles_d) >= 4:
+        prev_lows = [float(x.get("l", 0)) for x in candles_d[-4:-1]]
+        prev_highs = [float(x.get("h", 0)) for x in candles_d[-4:-1]]
+        prev_low = min(prev_lows); prev_high = max(prev_highs)
+        if direction == "PUMP" and d_l < prev_low and d_c > prev_low and lower_wick_pct >= 0.35:
+            score += 2.0; notes.append("sell-side sweep + reclaim")
+        if direction == "DUMP" and d_h > prev_high and d_c < prev_high and upper_wick_pct >= 0.35:
+            score += 2.0; notes.append("buy-side sweep + rejection")
+
+    # ── 3. Compression -> Expansion ────────────────────────────
+    if len(candles_d) >= 12:
+        ranges = [float(x.get("h", 0)) - float(x.get("l", 0)) for x in candles_d[-11:-1]]
+        avg_rng = sum(ranges) / len(ranges) if ranges else 0
+        cur_rng = d_h - d_l
+        if avg_rng > 0 and cur_rng > avg_rng * 1.35 and d_vr >= 1.2:
+            score += 1.2; notes.append("compression → expansion")
+        elif avg_rng > 0 and cur_rng < avg_rng * 0.75:
+            score -= 0.8; notes.append("compression chưa break")
+
+    # ── 4. Candle / absorption trap filter ─────────────────────
+    if direction == "PUMP":
+        if upper_wick_pct > 0.45 and body_pct < 0.35:
+            score -= 2.0; notes.append("wick xả mạnh / bull trap")
+        elif body_pct >= 0.45 and upper_wick_pct <= 0.30:
+            score += 0.8; notes.append("nến acceptance đẹp")
+    else:
+        if lower_wick_pct > 0.45 and body_pct < 0.35:
+            score -= 2.0; notes.append("wick hấp thụ / bear trap")
+        elif body_pct >= 0.45 and lower_wick_pct <= 0.30:
+            score += 0.8; notes.append("nến breakdown đẹp")
+
+    # ── 5. Futures data: OI / Funding / LSR / Liquidation ──────
+    fr_pct = funding_rate * 100
+    liq_ratio = (liq_shorts / liq_longs) if liq_longs > 0 else (99.0 if liq_shorts > 0 else 0.0)
+
+    if direction == "PUMP":
+        if oi_change_pct >= 15 and d_chg > 0:
+            score += 1.0; notes.append(f"OI xác nhận +{oi_change_pct:.1f}%")
+        elif oi_change_pct >= 15 and d_chg <= 1:
+            score -= 1.2; notes.append("OI tăng nhưng giá không chạy")
+        if fr_pct <= 0.03:
+            score += 0.8; notes.append("funding sạch")
+        elif fr_pct >= 0.10:
+            score -= 1.0; notes.append("funding long crowded")
+        if 0 < lsr <= 2.3:
+            score += 0.5; notes.append("L/S healthy")
+        elif lsr > 2.8:
+            score -= 1.0; notes.append("L/S crowded long")
+        if liq_ratio >= 1.5:
+            score += 0.8; notes.append("short squeeze fuel")
+    else:
+        if oi_change_pct >= 15 and d_chg < 0:
+            score += 1.0; notes.append(f"OI short xác nhận +{oi_change_pct:.1f}%")
+        elif oi_change_pct >= 15 and d_chg >= -1:
+            score -= 1.2; notes.append("OI tăng nhưng breakdown yếu")
+        if fr_pct >= 0.05:
+            score += 0.8; notes.append("funding thuận short / long trap")
+        elif fr_pct <= -0.10:
+            score -= 1.0; notes.append("funding âm dễ short squeeze")
+        if lsr > 2.3:
+            score += 0.5; notes.append("long crowded")
+        if liq_longs > liq_shorts * 1.5:
+            score += 0.8; notes.append("long squeeze fuel")
+
+    # ── 6. Final quality label ─────────────────────────────────
+    result.inst_score = round(score, 2)
+    result.final_score = round(result.mtf_score + result.inst_score, 2)
+    result.inst_notes = notes[:6]
+
+    if result.final_score >= 6.5 and result.inst_score >= 3:
+        result.trade_quality = "A+ INSTITUTIONAL"
+    elif result.final_score >= 4.5 and result.inst_score >= 1.5:
+        result.trade_quality = "A SETUP"
+    elif result.final_score >= 3.0:
+        result.trade_quality = "B SETUP / WAIT CONFIRM"
+    else:
+        result.trade_quality = "NO TRADE / LOW EDGE"
+
+    if direction == "PUMP":
+        result.bias = "STRONG LONG" if result.final_score >= 6.5 else "LONG" if result.final_score >= 4.5 else "NEUTRAL"
+    else:
+        result.bias = "STRONG SHORT" if result.final_score >= 6.5 else "SHORT" if result.final_score >= 4.5 else "NEUTRAL"
 
 def score_coin_mtf(exchange: str, symbol: str) -> Optional[MTFResult]:
     """
@@ -3095,12 +3243,31 @@ def score_coin_mtf(exchange: str, symbol: str) -> Optional[MTFResult]:
             result.tp2 = round(d_c - d_range * 1.0,   8)
             result.tp3 = round(d_c - d_range * 1.618, 8)
 
+    # ── Institutional Futures + SMC score ───────────────────────
+    fr = get_funding_rate(exchange, symbol) or 0.0
+    oi_change = 0.0
+    oi_hist = get_oi_history(exchange, symbol, limit=6)
+    if oi_hist and len(oi_hist) >= 5:
+        oi_now = float(oi_hist[-1].get("openInterest", 0))
+        oi_old = float(oi_hist[-5].get("openInterest", 0))
+        if oi_old > 0:
+            oi_change = (oi_now - oi_old) / oi_old * 100
+    lsr = get_lsr(exchange, symbol) or 0.0
+    liq_longs, liq_shorts = get_liquidation(exchange, symbol)
+    _institutional_mtf_score(result, candles_d, candles_h12 if 'candles_h12' in locals() else None,
+                             candles_h6 if 'candles_h6' in locals() else None, d_vr, fr, oi_change, lsr, liq_longs, liq_shorts)
+
+    # Filter cuối: bỏ setup thiếu edge institutional rõ ràng
+    if result.final_score < 3.0 or result.trade_quality.startswith("NO TRADE"):
+        return None
+
     # Signal label
     gc = result.green_count
+    prefix = "🏦 " + result.trade_quality + " — "
     if gc == 3:
-        result.signal_type = "🔥 3/3 KHUNG — MUA MẠNH NHẤT" if result.direction == "PUMP" else "🔥 3/3 KHUNG — SHORT MẠNH NHẤT"
+        result.signal_type = prefix + ("3/3 KHUNG LONG" if result.direction == "PUMP" else "3/3 KHUNG SHORT")
     else:
-        result.signal_type = "✅ 2/3 KHUNG — MUA TỐT" if result.direction == "PUMP" else "✅ 2/3 KHUNG — SHORT TỐT"
+        result.signal_type = prefix + ("2/3 KHUNG LONG" if result.direction == "PUMP" else "2/3 KHUNG SHORT")
 
     return result
 
@@ -3136,7 +3303,7 @@ def run_mtf_scan() -> tuple[list[MTFResult], list[MTFResult]]:
         log.info(f"✅ MTF {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
         return results
 
-    # 4 sàn song song
+    # 3 sàn song song
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
         futures = {ex_pool.submit(_scan_exchange_mtf, ex): ex for ex in SCAN_EXCHANGES}
         for future in as_completed(futures):
@@ -3153,7 +3320,7 @@ def run_mtf_scan() -> tuple[list[MTFResult], list[MTFResult]]:
     def dedup_mtf(lst: list[MTFResult]) -> list[MTFResult]:
         seen: dict[str, MTFResult] = {}
         # Sort: green_count cao trước, rồi abs(mtf_score) cao trước
-        for r in sorted(lst, key=lambda x: (x.green_count, abs(x.mtf_score)), reverse=True):
+        for r in sorted(lst, key=lambda x: (x.green_count, abs(x.final_score)), reverse=True):
             base = r.symbol.upper()
             if base.endswith("USDTM"): base = base[:-1]
             if base not in seen:
@@ -3164,9 +3331,9 @@ def run_mtf_scan() -> tuple[list[MTFResult], list[MTFResult]]:
     unique_dump = dedup_mtf(all_dump)
 
     # Sort pump: green_count cao → mtf_score cao
-    unique_pump.sort(key=lambda x: (x.green_count, x.mtf_score), reverse=True)
+    unique_pump.sort(key=lambda x: (x.green_count, x.final_score), reverse=True)
     # Sort dump: green_count cao → mtf_score âm nhất (abs cao nhất) = dump mạnh nhất
-    unique_dump.sort(key=lambda x: (x.green_count, abs(x.mtf_score)), reverse=True)
+    unique_dump.sort(key=lambda x: (x.green_count, abs(x.final_score)), reverse=True)
 
     log.info(f"📅 MTF scan xong: {time.time()-scan_start:.1f}s | pump {len(unique_pump)} | dump {len(unique_dump)}")
     return unique_pump[:1], unique_dump[:1]
@@ -3184,11 +3351,14 @@ def format_mtf_alert(pump_list: list[MTFResult], dump_list: list[MTFResult]) -> 
         lines.append(f"{'═'*27}")
         lines.append(f"{section_icon} <b>{section_label}</b>")
         lines.append(f"{'═'*27}\n")
+        notes = ", ".join(html.escape(x) for x in getattr(r, "inst_notes", [])[:5])
         lines.append(
-            f"<b>{sym}</b> — <b>{r.mtf_score:.2f}đ</b> | {r.green_count}/3 khung\n"
+            f"<b>{sym}</b> — <b>{r.final_score:.2f}đ</b> | MTF {r.mtf_score:.2f} + INST {r.inst_score:.2f} | {r.green_count}/3 khung\n"
+            f"BIAS: <b>{html.escape(r.bias)}</b> | <b>{html.escape(r.trade_quality)}</b>\n"
             f"⚡ <b>{html.escape(r.signal_type)}</b>\n"
             f"D: {r.icon_d}{r.chg_d:+.1f}% | H12: {r.icon_h12}{r.chg_h12:+.1f}% | H6: {r.icon_h6}{r.chg_h6:+.1f}%\n"
-            f"Vol D: {r.vr_d:.1f}x | Vol H6: {r.vr_h6:.1f}x"
+            f"Vol D: {r.vr_d:.1f}x | Vol H6: {r.vr_h6:.1f}x\n"
+            f"SMC/Futures: {notes if notes else 'đợi xác nhận thêm'}"
         )
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
@@ -3228,12 +3398,12 @@ def save_daily_watch(pump: list[MTFResult], dump: list[MTFResult]) -> None:
                   "entry": r.entry, "sl": r.sl,
                   "tp1": r.tp1, "tp2": r.tp2, "tp3": r.tp3,
                   "d_high": r.d_high, "d_low": r.d_low,
-                  "mtf_score": r.mtf_score, "green_count": r.green_count} for r in pump],
+                  "mtf_score": r.mtf_score, "final_score": r.final_score, "inst_score": r.inst_score, "bias": r.bias, "green_count": r.green_count} for r in pump],
         "dump": [{"symbol": r.symbol, "exchange": r.exchange,
                   "entry": r.entry, "sl": r.sl,
                   "tp1": r.tp1, "tp2": r.tp2, "tp3": r.tp3,
                   "d_high": r.d_high, "d_low": r.d_low,
-                  "mtf_score": r.mtf_score, "green_count": r.green_count} for r in dump],
+                  "mtf_score": r.mtf_score, "final_score": r.final_score, "inst_score": r.inst_score, "bias": r.bias, "green_count": r.green_count} for r in dump],
     }
     with open(f"results/{DAILY_WATCH_FILE}", "w") as f:
         _json.dump(data, f, ensure_ascii=False, indent=2)
