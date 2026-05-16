@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║  CRYPTO PUMP & DUMP SCANNER BOT V5                          ║
-║  Quét USDT Perp: Binance, Bybit, BingX                       ║
+║  Quét USDT Perp: Binance, Bybit                             ║
 ║  1D Trend/Squeeze + 1H Reversal Engine → Telegram           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -27,7 +27,7 @@ from config import (
 )
 
 # Có thể sửa nhanh tại đây
-SCAN_EXCHANGES = ["Binance", "Bybit", "BingX"]  # Quét 3 sàn, bỏ KuCoin để tránh lệch symbol/giá USDTM
+SCAN_EXCHANGES = ["Binance", "Bybit"]  # Chỉ quét Binance + Bybit, bỏ BingX/KuCoin để tránh lệch giá và signal nhiễu
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
@@ -68,7 +68,7 @@ MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt revers
 # REVERSAL output rule: chỉ lấy 1 LONG + 1 SHORT điểm cao nhất.
 # Ưu tiên Binance/Bybit khi điểm gần nhau để tránh lệch giá/spread ở sàn nhỏ.
 REVERSAL_TOP_PER_SIDE = 1
-REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2, "BingX": 1}
+REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2}
 REVERSAL_PRIORITY_SCORE_BONUS = 0.25
 
 # ── H2 Scan config ────────────────────────────────────────────
@@ -99,7 +99,7 @@ MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
 
 # Số workers tối đa cho parallel exchange scan (3 sàn chạy đồng thời)
-MAX_WORKERS_EXCHANGES = 3  # Chạy Binance + Bybit + BingX song song
+MAX_WORKERS_EXCHANGES = 2  # Chạy Binance + Bybit song song
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
 
 # ── Logging ──────────────────────────────────────────────────
@@ -1627,37 +1627,45 @@ def calc_reversal_tp(result: ScoreResult, coin: CoinData) -> None:
         digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
         return round(v, digits)
 
+    # REVERSAL là scalp/ngắn hạn nên TP không kéo quá xa kiểu D1 extension.
+    # Dùng R-multiple cố định để tránh case TP3 xa bất thường (-30% đến -40%).
+    # TP1 ≈ 1R, TP2 ≈ 1.6R, TP3 ≈ 2.3R.
     if result.reversal_type == "DUMP_REVERSAL":
-        sl    = entry - h1_range * 0.3   # SL dưới đáy nến 1H 30% range → R:R tốt hơn
-        tp1   = entry + h1_range * 0.5
-        tp2   = entry + h1_range * 1.0 * ext_mult
-        tp3   = entry + h1_range * 1.618 * ext_mult
-
-        result.sl  = fmt(sl)
-        result.tp1 = fmt(tp1)
-        result.tp2 = fmt(tp2)
-        result.tp3 = fmt(tp3)
-
+        sl = entry - h1_range * 0.3   # SL dưới đáy nến 1H 30% range
         risk = entry - sl
-        if risk > 0:
-            result.rr_tp1 = round((tp1 - entry) / risk, 2)
-            result.rr_tp2 = round((tp2 - entry) / risk, 2)
-
-    else:  # PUMP_REVERSAL (Short)
-        sl    = entry + h1_range * 0.3   # SL trên đỉnh nến 1H 30% range
-        tp1   = entry - h1_range * 0.5
-        tp2   = entry - h1_range * 1.0 * ext_mult
-        tp3   = entry - h1_range * 1.618 * ext_mult
+        if risk <= 0:
+            return
+        tp1 = entry + risk * 1.0
+        tp2 = entry + risk * 1.6
+        tp3 = entry + risk * 2.3
 
         result.sl  = fmt(sl)
         result.tp1 = fmt(tp1)
         result.tp2 = fmt(tp2)
         result.tp3 = fmt(tp3)
+        result.rr_tp1 = 1.0
+        result.rr_tp2 = 1.6
 
+    else:  # PUMP_REVERSAL / H1_BREAKOUT_SHORT
+        sl = entry + h1_range * 0.3   # SL trên đỉnh nến 1H 30% range
         risk = sl - entry
-        if risk > 0:
-            result.rr_tp1 = round((entry - tp1) / risk, 2)
-            result.rr_tp2 = round((entry - tp2) / risk, 2)
+        if risk <= 0:
+            return
+        tp1 = entry - risk * 1.0
+        tp2 = entry - risk * 1.6
+        tp3 = entry - risk * 2.3
+
+        # Không cho TP âm đối với coin giá nhỏ.
+        tp1 = max(tp1, entry * 0.01)
+        tp2 = max(tp2, entry * 0.01)
+        tp3 = max(tp3, entry * 0.01)
+
+        result.sl  = fmt(sl)
+        result.tp1 = fmt(tp1)
+        result.tp2 = fmt(tp2)
+        result.tp3 = fmt(tp3)
+        result.rr_tp1 = 1.0
+        result.rr_tp2 = 1.6
 
 
 def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
@@ -2668,10 +2676,10 @@ def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResul
 
 def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     """
-    Quét 3 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
+    Quét 2 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
 
     Kiến trúc parallel 2 tầng:
-      Tầng 1: 3 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=3)
+      Tầng 1: 2 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=2)
       Tầng 2: Mỗi sàn scan symbol của mình song song (workers riêng từng sàn)
 
     Quy tắc PUMP: SQUEEZE ưu tiên TOP 1, còn lại theo total_score.
@@ -3148,6 +3156,7 @@ def job_reversal_only():
             log.info(f"  {r.reversal_type}: {r.display_symbol} {r.total_score:.1f}đ — {r.signal_type}")
             log.info(f"  1D: {r.price_chg:+.2f}% | 1H: {r.h1_chg:+.2f}%")
 
+        register_active_trades(rev_results, source="REVERSAL_30M")
         msg = format_reversal_alert(rev_results)
         if send_telegram(msg):
             log.info("✅ Reversal alert đã gửi!")
@@ -3972,6 +3981,7 @@ def job():
                 log.info(f"   {d}")
 
         save_results(pump_results, dump_results, rev_results)
+        register_active_trades((pump_results or []) + (dump_results or []) + (rev_results or []), source="HOURLY_SCAN")
         msg = format_alert(pump_results, dump_results, rev_results)
         if send_telegram(msg):
             log.info("✅ Đã gửi Telegram alert!")
@@ -3982,6 +3992,200 @@ def job():
         log.error(f"Job error: {e}", exc_info=True)
         send_telegram(f"❌ Scanner error: {e}")
 
+
+
+
+# ══════════════════════════════════════════════════════════════
+# ACTIVE TRADE MONITOR — CHECK MỖI 30 PHÚT
+# ══════════════════════════════════════════════════════════════
+
+ACTIVE_TRADES_FILE = "active_trades.json"
+MONITOR_INTERVAL_MINUTES = 30
+MONITOR_PRICE_ADVERSE_PCT = 1.5       # Giá đi ngược entry 1.5% thì cảnh báo thoát sớm
+MONITOR_CVD_BARS = 3                  # Dùng 3 nến M30 gần nhất để làm CVD proxy
+MONITOR_CVD_BEARISH_BARS = 2          # LONG: >=2/3 nến signed volume âm = xấu
+MONITOR_CVD_BULLISH_BARS = 2          # SHORT: >=2/3 nến signed volume dương = xấu
+MONITOR_FUNDING_LONG_MAX = 0.08       # LONG: funding > 0.08% = crowded long, xấu
+MONITOR_FUNDING_SHORT_MIN = -0.08     # SHORT: funding < -0.08% = crowded short, xấu
+
+
+def _active_trade_key(exchange: str, symbol: str, side: str) -> str:
+    return f"{exchange}:{symbol}:{side}".upper()
+
+
+def _load_active_trades() -> dict:
+    try:
+        with open(ACTIVE_TRADES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_active_trades(data: dict) -> None:
+    try:
+        with open(ACTIVE_TRADES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Không lưu được {ACTIVE_TRADES_FILE}: {e}")
+
+
+def _result_side_for_hold(r: ScoreResult) -> str:
+    side = _reversal_side(r) if getattr(r, "reversal_type", "") else ""
+    if side:
+        return side
+    sig = (r.signal_type or r.market_mode or "").upper()
+    if "SHORT" in sig or "DUMP" in sig:
+        return "SHORT"
+    return "LONG"
+
+
+def register_active_trades(results: list[ScoreResult], source: str = "SCAN") -> None:
+    """Lưu các signal mới để monitor mỗi 30 phút. Không lưu nếu thiếu entry/SL."""
+    data = _load_active_trades()
+    now = datetime.now(timezone.utc).isoformat()
+    added = 0
+
+    for r in results or []:
+        if not r or r.entry <= 0 or r.sl <= 0:
+            continue
+        side = _result_side_for_hold(r)
+        key = _active_trade_key(r.exchange, r.symbol, side)
+        data[key] = {
+            "symbol": r.symbol,
+            "exchange": r.exchange,
+            "side": side,
+            "entry": float(r.entry),
+            "sl": float(r.sl),
+            "tp1": float(r.tp1),
+            "tp2": float(r.tp2),
+            "tp3": float(r.tp3),
+            "score": float(r.total_score),
+            "source": source,
+            "created_at": now,
+            "last_check": "",
+            "exit_alerted": False,
+        }
+        added += 1
+
+    if added:
+        _save_active_trades(data)
+        log.info(f"📌 Đã đưa {added} signal vào active_trades để monitor 30 phút/lần.")
+
+
+def _signed_cvd_proxy(candles: list, bars: int = MONITOR_CVD_BARS) -> tuple[float, int, int]:
+    """Proxy CVD bằng signed volume M30: nến xanh +vol, nến đỏ -vol."""
+    if not candles:
+        return 0.0, 0, 0
+    recent = candles[-bars:]
+    cvd = 0.0
+    bull = bear = 0
+    for c in recent:
+        o = float(c.get("o", 0)); cl = float(c.get("c", 0)); v = float(c.get("v", 0))
+        if cl >= o:
+            cvd += v; bull += 1
+        else:
+            cvd -= v; bear += 1
+    return cvd, bull, bear
+
+
+def _fmt_pct_value(v: float) -> str:
+    return f"{v:+.2f}%"
+
+
+def monitor_active_trades() -> None:
+    """
+    Job riêng chạy mỗi 30 phút:
+    - Check Price vs Entry/SL
+    - Check CVD proxy M30
+    - Check Funding
+    Nếu deterioration → alert THOÁT ngay và không spam lại.
+    """
+    data = _load_active_trades()
+    if not data:
+        log.info("👁️ Monitor: không có coin đang hold.")
+        return
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    exit_blocks = []
+    changed = False
+
+    for key, t in list(data.items()):
+        if t.get("exit_alerted"):
+            continue
+
+        symbol = t.get("symbol")
+        exchange = t.get("exchange")
+        side = t.get("side", "LONG")
+        entry = float(t.get("entry", 0) or 0)
+        sl = float(t.get("sl", 0) or 0)
+        if not symbol or not exchange or entry <= 0:
+            continue
+
+        try:
+            candles = get_ohlcv_m30(exchange, symbol, limit=8) or []
+            if not candles:
+                continue
+            last = candles[-1]
+            price = float(last.get("c", 0))
+            if price <= 0:
+                continue
+
+            funding = get_funding_rate(exchange, symbol) or 0.0
+            funding_pct = funding * 100
+            cvd_proxy, bull_bars, bear_bars = _signed_cvd_proxy(candles, MONITOR_CVD_BARS)
+            pnl_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+
+            reasons = []
+            if side == "LONG":
+                if sl > 0 and price <= sl:
+                    reasons.append("giá chạm/vượt SL")
+                if price <= entry * (1 - MONITOR_PRICE_ADVERSE_PCT / 100):
+                    reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
+                if bear_bars >= MONITOR_CVD_BEARISH_BARS and cvd_proxy < 0:
+                    reasons.append("CVD M30 proxy xấu")
+                if funding_pct >= MONITOR_FUNDING_LONG_MAX:
+                    reasons.append(f"funding quá dương {funding_pct:.4f}%")
+            else:
+                if sl > 0 and price >= sl:
+                    reasons.append("giá chạm/vượt SL")
+                if price >= entry * (1 + MONITOR_PRICE_ADVERSE_PCT / 100):
+                    reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
+                if bull_bars >= MONITOR_CVD_BULLISH_BARS and cvd_proxy > 0:
+                    reasons.append("CVD M30 proxy xấu")
+                if funding_pct <= MONITOR_FUNDING_SHORT_MIN:
+                    reasons.append(f"funding quá âm {funding_pct:.4f}%")
+
+            t["last_check"] = datetime.now(timezone.utc).isoformat()
+            t["last_price"] = price
+            t["last_pnl_pct"] = pnl_pct
+            changed = True
+
+            if reasons:
+                t["exit_alerted"] = True
+                changed = True
+                side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
+                exit_blocks.append(
+                    f"🚨 <b>THOÁT NGAY</b>\n"
+                    f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
+                    f"Entry: <b>{entry:.6g}</b> | Giá: <b>{price:.6g}</b> | PnL: <b>{pnl_pct:+.2f}%</b>\n"
+                    f"SL: <b>{sl:.6g}</b> | Funding: <b>{funding_pct:.4f}%</b>\n"
+                    f"Lý do: {html.escape(', '.join(reasons))}"
+                )
+        except Exception as e:
+            log.debug(f"Monitor lỗi {key}: {e}")
+
+    if changed:
+        _save_active_trades(data)
+
+    if exit_blocks:
+        msg = f"👁️ <b>MONITOR 30M — {now}</b>\n\n" + "\n\n".join(exit_blocks)
+        if send_telegram(msg):
+            log.info(f"🚨 Monitor gửi alert THOÁT: {len(exit_blocks)} coin")
+        else:
+            log.error("❌ Monitor gửi alert thất bại")
+    else:
+        log.info("👁️ Monitor: chưa có deterioration.")
 
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
@@ -4022,61 +4226,91 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── SCHEDULER V7: quét MỖI GIỜ lúc xx:02 UTC ─────────────
-        # Mỗi lần chạy: PUMP + DUMP + REVERSAL, alert gọn gồm:
-        # coin, khuyến nghị LONG/SHORT, Entry, SL, TP1/TP2/TP3.
+        # ── SCHEDULER V7.1 ───────────────────────────────────────
+        # xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL
+        # mỗi 30 phút → Monitor coin đang hold: Price + CVD proxy + Funding
         from datetime import timedelta
 
         FULL_SCAN_MINUTE = 2
-        CHECK_SLEEP = 30
+        MONITOR_MINUTES = (17, 47)   # monitor riêng mỗi 30 phút, tránh trùng full scan xx:02
+        CHECK_SLEEP = 20
+
+        def _next_time_slot_utc(minutes: tuple[int, ...], now=None):
+            now = now or datetime.now(timezone.utc)
+            candidates = []
+            for m in minutes:
+                t = now.replace(minute=m, second=0, microsecond=0)
+                if t <= now:
+                    t += timedelta(hours=1)
+                candidates.append(t)
+            return min(candidates)
 
         def next_hourly_slot_utc(now=None):
-            now = now or datetime.now(timezone.utc)
-            target = now.replace(minute=FULL_SCAN_MINUTE, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(hours=1)
-            return target
+            return _next_time_slot_utc((FULL_SCAN_MINUTE,), now)
+
+        def next_monitor_slot_utc(now=None):
+            return _next_time_slot_utc(MONITOR_MINUTES, now)
 
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
-        log.info("⏰ SCHEDULER V7 khởi động")
+        log.info("⏰ SCHEDULER V7.1 khởi động")
         log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
+        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold, alert THOÁT nếu deteriorate")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
-        last_executed_slot = ""
+        last_full_slot = ""
+        last_monitor_slot = ""
 
         while True:
-            target = next_hourly_slot_utc()
+            now = datetime.now(timezone.utc)
+            full_target = next_hourly_slot_utc(now)
+            mon_target = next_monitor_slot_utc(now)
+            target = min(full_target, mon_target)
+            wait = (target - now).total_seconds()
 
-            while True:
-                now = datetime.now(timezone.utc)
-                wait = (target - now).total_seconds()
-                if wait <= 0:
-                    break
-                log.info(f"⏳ Đợi {wait/60:.1f}p đến {target.strftime('%H:%M UTC')} (Full scan hourly)...")
+            if wait > 0:
+                log.info(
+                    f"⏳ Đợi {wait/60:.1f}p | Full: {full_target.strftime('%H:%M UTC')} | "
+                    f"Monitor: {mon_target.strftime('%H:%M UTC')}"
+                )
                 time.sleep(min(wait, CHECK_SLEEP))
-
-            current_slot = slot_id(target)
-            if current_slot == last_executed_slot:
-                log.warning(f"⚠️ Slot {current_slot} đã chạy — bỏ qua")
-                time.sleep(60)
                 continue
 
-            scan_start_dt = datetime.now(timezone.utc)
-            scan_start = time.time()
-            last_executed_slot = current_slot
+            now = datetime.now(timezone.utc)
 
-            try:
-                log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan hourly...")
-                job()
-            except Exception as e:
-                log.error(f"Scheduler hourly error: {e}", exc_info=True)
-                try:
-                    send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
-                except Exception:
-                    pass
+            # Full scan hourly
+            if now >= full_target:
+                current_slot = slot_id(full_target)
+                if current_slot != last_full_slot:
+                    last_full_slot = current_slot
+                    scan_start_dt = datetime.now(timezone.utc)
+                    scan_start = time.time()
+                    try:
+                        log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan hourly...")
+                        job()
+                    except Exception as e:
+                        log.error(f"Scheduler hourly error: {e}", exc_info=True)
+                        try:
+                            send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
+                        except Exception:
+                            pass
+                    elapsed = time.time() - scan_start
+                    log.info(f"✅ Full scan xong {elapsed:.0f}s")
 
-            elapsed = time.time() - scan_start
-            next_target = next_hourly_slot_utc(datetime.now(timezone.utc))
-            log.info(f"✅ Xong {elapsed:.0f}s — tiếp theo: {next_target.strftime('%H:%M UTC')} (Full scan hourly)")
+            # Monitor active trades 30m
+            if now >= mon_target:
+                current_slot = slot_id(mon_target)
+                if current_slot != last_monitor_slot:
+                    last_monitor_slot = current_slot
+                    try:
+                        log.info(f"👁️ [{now.strftime('%H:%M UTC')}] Monitor active trades...")
+                        monitor_active_trades()
+                    except Exception as e:
+                        log.error(f"Monitor scheduler error: {e}", exc_info=True)
+                        try:
+                            send_telegram(f"❌ [monitor] error: {html.escape(str(e))}")
+                        except Exception:
+                            pass
+
+            time.sleep(5)
