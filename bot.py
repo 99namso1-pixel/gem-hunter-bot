@@ -55,6 +55,12 @@ DUMP_REV_1H_VOL_MULT = 1.5            # Vol 1H ≥ 1.5x MA10_1H
 INTRADAY_DUMP_MIN = 15.0              # Intraday dump (open→low) ≥ 15% trong nến ngày hiện tại
 MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt reversal list
 
+# ── H2 Scan config ────────────────────────────────────────────
+H2_MIN_CHG      = 7.0    # H2 tăng/giảm tối thiểu 7%
+H2_MIN_VOL      = 1.3    # vol_ratio H2 tối thiểu (thấp hơn D vì H2 vol hay thấp)
+H2_MIN_SCORE    = 4.0    # ngưỡng điểm (thấp hơn D=5.0)
+H2_SCAN_HOURS   = 2      # quét mỗi 2H
+
 # ── 1H Momentum Breakout ──────────────────────────────────────
 # Signal độc lập với 1D — bắt nến 1H pump/dump mạnh có vol spike
 # Ví dụ: MLNUSDT 07:00 UTC 14/5 — +10.37% vol 9.3x FR âm
@@ -744,6 +750,78 @@ def get_ohlcv_m30(exchange: str, symbol: str, limit: int = 15) -> Optional[list]
     return None
 
 
+# ── H6 / H12 OHLCV (cho MTF Daily scan) ─────────────────────
+
+def _get_ohlcv_interval(exchange: str, symbol: str, interval_binance: str,
+                         interval_bybit: str, interval_bingx: str,
+                         interval_kucoin_min: int, limit: int = 10) -> Optional[list]:
+    """Generic multi-exchange OHLCV fetcher cho H6/H12."""
+    if exchange == "Binance":
+        data = http_get_quick(f"{BINANCE_BASE}/fapi/v1/klines", {
+            "symbol": symbol, "interval": interval_binance, "limit": limit,
+        })
+        if not data or not isinstance(data, list):
+            return None
+        return [{"t": int(r[0]), "o": float(r[1]), "h": float(r[2]),
+                 "l": float(r[3]), "c": float(r[4]), "v": float(r[5])} for r in data]
+
+    if exchange == "Bybit":
+        data = bybit_get("/v5/market/kline", {
+            "category": "linear", "symbol": symbol,
+            "interval": interval_bybit, "limit": limit,
+        })
+        if not data:
+            return None
+        rows = list(reversed(data.get("list", [])))
+        return [{"t": int(r[0]), "o": float(r[1]), "h": float(r[2]),
+                 "l": float(r[3]), "c": float(r[4]), "v": float(r[5])} for r in rows] if rows else None
+
+    if exchange == "BingX":
+        api_symbol = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else symbol
+        data = http_get_quick(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", {
+            "symbol": api_symbol, "interval": interval_bingx, "limit": limit,
+        })
+        if not data:
+            return None
+        rows = data.get("data", []) if isinstance(data, dict) else data
+        if not rows:
+            return None
+        candles = []
+        for row in rows:
+            try:
+                candles.append({
+                    "t": int(row.get("time", row[0] if isinstance(row, list) else 0)),
+                    "o": float(row.get("open",  row[1] if isinstance(row, list) else 0)),
+                    "h": float(row.get("high",  row[2] if isinstance(row, list) else 0)),
+                    "l": float(row.get("low",   row[3] if isinstance(row, list) else 0)),
+                    "c": float(row.get("close", row[4] if isinstance(row, list) else 0)),
+                    "v": float(row.get("volume",row[5] if isinstance(row, list) else 0)),
+                })
+            except Exception:
+                continue
+        return candles if candles else None
+
+    if exchange == "KuCoin":
+        return _kucoin_parse_candles(
+            kucoin_get_quick("/api/v1/kline/query", {
+                "symbol": symbol, "granularity": interval_kucoin_min, "limit": limit,
+            })
+        )
+    return None
+
+
+def get_ohlcv_h6(exchange: str, symbol: str, limit: int = 10) -> Optional[list]:
+    return _get_ohlcv_interval(exchange, symbol, "6h", "360", "6h", 360, limit)
+
+
+def get_ohlcv_h12(exchange: str, symbol: str, limit: int = 6) -> Optional[list]:
+    return _get_ohlcv_interval(exchange, symbol, "12h", "720", "12h", 720, limit)
+
+
+def get_ohlcv_h2(exchange: str, symbol: str, limit: int = 15) -> Optional[list]:
+    return _get_ohlcv_interval(exchange, symbol, "2h", "120", "2h", 120, limit)
+
+
 # ══════════════════════════════════════════════════════════════
 # FUNDING / OI / LSR / LIQUIDATION
 # Ưu tiên Binance/Bybit public API để tránh Coinglass bị 500.
@@ -1099,6 +1177,33 @@ def classify_market_mode(result: ScoreResult, coin: CoinData, vol_ratio: float) 
     elif result.market_mode == "TREND":
         result.total_score += 0.4
 
+def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
+    """Tính Entry/SL/TP cho pump/dump từ range nến D."""
+    import math
+    d_range = coin.high - coin.low
+    if d_range <= 0 or coin.close <= 0:
+        return
+
+    def fmt(v: float) -> float:
+        if v <= 0: return 0.0
+        digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
+        return round(v, digits)
+
+    entry = coin.close
+    result.entry = fmt(entry)
+
+    if coin.close >= coin.open:  # PUMP
+        result.sl  = fmt(coin.low  - d_range * 0.1)
+        result.tp1 = fmt(entry + d_range * 0.5)
+        result.tp2 = fmt(entry + d_range * 1.0)
+        result.tp3 = fmt(entry + d_range * 1.618)
+    else:  # DUMP
+        result.sl  = fmt(coin.high + d_range * 0.1)
+        result.tp1 = fmt(entry - d_range * 0.5)
+        result.tp2 = fmt(entry - d_range * 1.0)
+        result.tp3 = fmt(entry - d_range * 1.618)
+
+
 def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     """Score coin tiềm năng PUMP (nến xanh, momentum tăng)."""
     # Chỉ xét nến xanh cho PUMP
@@ -1283,10 +1388,8 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     result.details = details
     if result.total_score < MIN_SCORE:
         return None
+    calc_pump_tp_sl(result, coin)
     return result
-
-
-def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
     """Score coin tiềm năng DUMP (nến đỏ, momentum giảm mạnh)."""
     # Chỉ xét nến đỏ cho DUMP
     if coin.close >= coin.open:
@@ -1436,6 +1539,7 @@ def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
     result.details = details
     if result.total_score < MIN_DUMP_SCORE:
         return None
+    calc_pump_tp_sl(result, coin)
     return result
 
 
@@ -2067,6 +2171,218 @@ def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
     return result
 
 
+def calc_h2_tp_sl(result: ScoreResult, h2_high: float, h2_low: float,
+                   h2_close: float, direction: str) -> None:
+    """
+    TP/SL ngắn hạn cho H2 — target 15-30%.
+    TP1 = range*0.5, TP2 = range*1.0, TP3 = range*1.5
+    """
+    import math
+    h2_range = h2_high - h2_low
+    if h2_range <= 0 or h2_close <= 0:
+        return
+
+    def fmt(v: float) -> float:
+        if v <= 0: return 0.0
+        digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
+        return round(v, digits)
+
+    entry = h2_close
+    result.entry = fmt(entry)
+
+    if direction == "PUMP":
+        result.sl  = fmt(h2_low  - h2_range * 0.15)   # SL chặt hơn D
+        result.tp1 = fmt(entry   + h2_range * 0.5)     # ~10-15%
+        result.tp2 = fmt(entry   + h2_range * 1.0)     # ~20-30%
+        result.tp3 = fmt(entry   + h2_range * 1.5)     # ~35-45%
+    else:  # DUMP
+        result.sl  = fmt(h2_high + h2_range * 0.15)
+        result.tp1 = fmt(entry   - h2_range * 0.5)
+        result.tp2 = fmt(entry   - h2_range * 1.0)
+        result.tp3 = fmt(entry   - h2_range * 1.5)
+
+    risk = abs(entry - result.sl)
+    reward1 = abs(result.tp1 - entry)
+    reward2 = abs(result.tp2 - entry)
+    if risk > 0:
+        result.rr_tp1 = round(reward1 / risk, 1)
+        result.rr_tp2 = round(reward2 / risk, 1)
+
+
+def score_coin_h2(exchange: str, symbol: str) -> Optional[ScoreResult]:
+    """
+    Score coin khung H2 — tìm pump/dump ngắn hạn sau khi nến H2 đóng.
+    Ngưỡng thấp hơn 1D: MIN_CHG=7%, MIN_VOL=1.3x, MIN_SCORE=4.0đ
+    Target: TP 15-30%
+
+    Điểm đặc biệt so với D:
+    - Thêm bonus nến không bóng dưới (low=open) → mua mạnh
+    - Thêm bonus FR âm + pump = short squeeze H2
+    - Liq shorts >> longs = squeeze setup
+    """
+    candles = get_ohlcv_h2(exchange, symbol, limit=15)
+    if not candles or len(candles) < 5:
+        return None
+
+    # Nến vừa đóng = candles[-1]
+    latest = candles[-1]
+    h2_o = float(latest.get("o", 0)); h2_h = float(latest.get("h", 0))
+    h2_l = float(latest.get("l", 0)); h2_c = float(latest.get("c", 0))
+    h2_v = float(latest.get("v", 0))
+    if h2_o <= 0 or h2_c <= 0:
+        return None
+
+    # Vol MA10 từ 10 nến trước
+    prev_vols = [float(c.get("v", 0)) for c in candles[-11:-1]]
+    vol_ma = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    if vol_ma <= 0:
+        return None
+
+    h2_chg = (h2_c - h2_o) / h2_o * 100
+    vol_ratio = h2_v / vol_ma
+
+    # Filter cơ bản
+    if abs(h2_chg) < H2_MIN_CHG:
+        return None
+
+    direction = "PUMP" if h2_chg > 0 else "DUMP"
+
+    # Lấy thêm data FR, OI, LSR, Liq
+    fr  = get_funding_rate(exchange, symbol) or 0
+    oi_hist = get_oi_history(exchange, symbol, limit=4)
+    oi_chg = 0.0
+    if oi_hist and len(oi_hist) >= 2:
+        oi_new = float(oi_hist[-1].get("openInterest", 0))
+        oi_old = float(oi_hist[-3].get("openInterest", oi_new))
+        if oi_old > 0:
+            oi_chg = (oi_new - oi_old) / oi_old * 100
+
+    lsr = get_lsr(exchange, symbol) or 1.0
+    liq_longs, liq_shorts = get_liquidation(exchange, symbol)
+    fr_pct = fr * 100
+
+    result = ScoreResult(symbol=symbol, exchange=exchange)
+    result.timeframe     = "2H"
+    result.price_current = round(h2_c, 8)
+    result.day_low       = round(h2_l, 8)
+    result.price_chg     = round(h2_chg, 2)
+    result.vol_ratio     = round(vol_ratio, 2)
+    result.oi_chg_pct    = round(oi_chg, 1)
+    result.fr            = round(fr_pct, 4)
+    result.lsr           = round(lsr, 4)
+    result.liq_ratio     = round(liq_shorts / liq_longs, 2) if liq_longs > 0 else 0
+
+    score   = 0.0
+    details = []
+
+    if direction == "PUMP":
+        # 1. Momentum H2
+        if abs(h2_chg) >= 20 and vol_ratio >= 2:
+            score += 3.0; details.append(f"🚀 H2 pump cực mạnh (+{h2_chg:.1f}% vol {vol_ratio:.1f}x)")
+        elif abs(h2_chg) >= 12 and vol_ratio >= 1.5:
+            score += 2.5; details.append(f"🚀 H2 pump mạnh (+{h2_chg:.1f}% vol {vol_ratio:.1f}x)")
+        elif abs(h2_chg) >= 20:
+            score += 2.5; details.append(f"🚀 H2 thin-air cực (+{h2_chg:.1f}%)")
+        elif abs(h2_chg) >= 12:
+            score += 2.0; details.append(f"🚀 H2 thin-air (+{h2_chg:.1f}%)")
+        else:
+            score += 1.5; details.append(f"📈 H2 pump (+{h2_chg:.1f}%)")
+
+        # 2. Vol spike
+        if vol_ratio >= 5:
+            score += 3.0; details.append(f"💥 Vol H2 spike cực mạnh ({vol_ratio:.1f}x)")
+        elif vol_ratio >= 3:
+            score += 2.0; details.append(f"💥 Vol H2 spike ({vol_ratio:.1f}x)")
+        elif vol_ratio >= H2_MIN_VOL:
+            score += 1.0; details.append(f"📊 Vol H2 tăng ({vol_ratio:.1f}x)")
+
+        # 3. OI
+        if oi_chg >= 20 and oi_chg > abs(h2_chg):
+            score += 2.0; details.append(f"📡 OI +{oi_chg:.1f}% — long mới vào mạnh")
+        elif oi_chg >= 10:
+            score += 1.0; details.append(f"📡 OI +{oi_chg:.1f}%")
+        elif oi_chg <= -5:
+            score += 1.0; details.append(f"📡 OI -{abs(oi_chg):.1f}% — short cover")
+
+        # 4. FR âm = short squeeze fuel
+        if fr_pct <= -0.3:
+            score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%) — short squeeze")
+        elif fr_pct <= -0.05:
+            score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
+        elif fr_pct <= 0.05:
+            score += 0.5; details.append(f"💰 FR thấp ({fr_pct:.4f}%)")
+
+        # 5. Liq: shorts bị liq >> longs
+        if liq_longs > 0:
+            liq_ratio = liq_shorts / liq_longs
+            if liq_ratio >= 5:
+                score += 2.0; details.append(f"💥 Shorts liq {liq_ratio:.0f}x — squeeze mạnh")
+            elif liq_ratio >= 2:
+                score += 1.0; details.append(f"✅ Shorts liq {liq_ratio:.1f}x")
+        elif liq_shorts > 0:
+            score += 1.5; details.append(f"💥 Shorts liq — không có long bị liq")
+
+        # 6. Nến đặc biệt: low=open = không có selling pressure
+        if abs(h2_l - h2_o) / h2_o < 0.002:   # low ≈ open (trong 0.2%)
+            score += 1.0; details.append("🕯️ Low≈Open — không có bóng dưới (mua mạnh)")
+
+        # 7. LSR
+        if 1.0 <= lsr <= 2.3:
+            score += 0.5; details.append(f"📈 L/S {lsr:.3f} ✅")
+        elif lsr > 2.3:
+            score -= 0.5
+
+        result.signal_type = (
+            "🚀💥 H2 SHORT SQUEEZE" if fr_pct <= -0.1 and (liq_shorts > liq_longs * 2) else
+            "🚀 H2 PUMP MẠNH" if abs(h2_chg) >= 15 else
+            "📈 H2 PUMP"
+        )
+
+    else:  # DUMP
+        if abs(h2_chg) >= 20 and vol_ratio >= 2:
+            score += 3.0; details.append(f"📉 H2 dump cực mạnh ({h2_chg:.1f}% vol {vol_ratio:.1f}x)")
+        elif abs(h2_chg) >= 12:
+            score += 2.0; details.append(f"📉 H2 dump ({h2_chg:.1f}%)")
+        else:
+            score += 1.5; details.append(f"🔻 H2 giảm ({h2_chg:.1f}%)")
+
+        if vol_ratio >= 5:
+            score += 3.0; details.append(f"💥 Panic vol ({vol_ratio:.1f}x)")
+        elif vol_ratio >= 3:
+            score += 2.0
+        elif vol_ratio >= H2_MIN_VOL:
+            score += 1.0
+
+        if oi_chg >= 10:
+            score += 1.0; details.append(f"📡 OI +{oi_chg:.1f}% — short vào")
+        elif oi_chg <= -10:
+            score += 1.5; details.append(f"📡 OI -{abs(oi_chg):.1f}% — long tháo")
+
+        if fr_pct >= 0.15:
+            score += 1.5; details.append(f"💥 FR dương cao ({fr_pct:.3f}%) — long trap")
+        elif fr_pct >= 0.05:
+            score += 0.5
+
+        if liq_longs > 0 and liq_shorts > 0:
+            lr = liq_longs / liq_shorts
+            if lr >= 5:
+                score += 2.0; details.append(f"💥 Longs liq {lr:.0f}x — cascade")
+            elif lr >= 2:
+                score += 1.0
+
+        result.signal_type = "📉 H2 DUMP MẠNH" if abs(h2_chg) >= 15 else "⬇️ H2 DUMP"
+
+    result.total_score = round(score, 1)
+    result.details     = details
+    result.market_mode = f"H2_{direction}"
+
+    if result.total_score < H2_MIN_SCORE:
+        return None
+
+    calc_h2_tp_sl(result, h2_h, h2_l, h2_c, direction)
+    return result
+
+
 def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     Optional[ScoreResult], Optional[ScoreResult], Optional[ScoreResult]
 ]:
@@ -2165,8 +2481,8 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     Quy tắc DUMP: top 2 theo total_score.
     Quy tắc REVERSAL: top 1 mỗi loại (PUMP_REV + DUMP_REV).
     """
-    TOP_PUMP = 2
-    TOP_DUMP = 2
+    TOP_PUMP = 1
+    TOP_DUMP = 1
 
     all_pump: list[ScoreResult] = []
     all_dump: list[ScoreResult] = []
@@ -2284,7 +2600,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                  rev_results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"🚀📉🔄 <b>PUMP &amp; DUMP &amp; REVERSAL SCANNER V6</b>",
+        f"🚀📉 <b>PUMP &amp; DUMP SCANNER V6</b>",
         f"🕒 <b>{now}</b>",
         f"📊 Quét: {' | '.join(SCAN_EXCHANGES)} — 1D + 1H\n",
     ]
@@ -2319,12 +2635,23 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             elif r.market_mode == "TREND":
                 engine_info = f" | 🟢TR:{r.trend_score:.1f}"
 
+            def pct(t, e):
+                if e <= 0: return ""
+                return f"{(t-e)/e*100:+.2f}%"
+
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
                 f"{mode_icon} <b>{signal}</b>\n"
-                f"💰 Giá: <b>{r.price_current:.6g}</b> | Low ngày: {r.day_low:.6g} | +{r.price_chg:.2f}%"
+                f"💰 Giá: <b>{r.price_current:.6g}</b> | +{r.price_chg:.2f}%"
             )
+            if r.entry > 0 and r.tp1 > 0:
+                lines.append(
+                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                )
             lines.append("")
     else:
         lines.append("<i>Không tìm thấy coin pump đủ điều kiện.</i>\n")
@@ -2345,89 +2672,26 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             symbol   = html.escape(r.display_symbol)
             signal   = html.escape(str(r.signal_type))
 
+            def pct_d(t, e):
+                if e <= 0: return ""
+                return f"{(t-e)/e*100:+.2f}%"
+
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
                 f"📉 <b>{signal}</b>\n"
-                f"💰 Giá: <b>{r.price_current:.6g}</b> | Low ngày: {r.day_low:.6g} | {r.price_chg:.2f}%"
+                f"💰 Giá: <b>{r.price_current:.6g}</b> | {r.price_chg:.2f}%"
             )
+            if r.entry > 0 and r.tp1 > 0:
+                lines.append(
+                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct_d(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct_d(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct_d(r.tp3, r.entry)})"
+                )
             lines.append("")
     else:
         lines.append("<i>Không tìm thấy coin dump đủ điều kiện.</i>\n")
-
-    # ── REVERSAL SECTION ──────────────────────────────────────────
-    lines.append("═══════════════════════════")
-    lines.append("🔄 <b>REVERSAL SIGNALS (1H)</b>")
-    lines.append("═══════════════════════════\n")
-
-    if rev_results:
-        for r in rev_results:
-            symbol   = html.escape(r.display_symbol)
-            signal   = html.escape(str(r.signal_type))
-            details  = html.escape(" | ".join(str(x) for x in r.details[:4]))
-
-            if r.reversal_type == "PUMP_REVERSAL":
-                rev_icon  = "🔴🔄"
-                rev_label = "PUMP → ĐẢO CHIỀU XUỐNG (SHORT)"
-                chg_line  = f"1D: +{r.price_chg:.2f}% | 1H: {r.h1_chg:.2f}%"
-                direction = "SHORT"
-                sl_label  = "SL (trên đỉnh)"
-            elif r.reversal_type == "DUMP_REVERSAL":
-                rev_icon  = "🟢🔄"
-                rev_label = "DUMP → BẬT NGƯỢC LÊN (LONG)"
-                chg_line  = f"1D: {r.price_chg:.2f}% | 1H: +{r.h1_chg:.2f}%"
-                direction = "LONG"
-                sl_label  = "SL (dưới đáy)"
-            elif r.reversal_type == "H1_BREAKOUT_LONG":
-                rev_icon  = "🟢⚡"
-                rev_label = "H1 BREAKOUT — LONG"
-                chg_line  = f"1H: +{r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
-                direction = "LONG"
-                sl_label  = "SL (dưới đáy)"
-            else:  # H1_BREAKOUT_SHORT
-                rev_icon  = "🔴⚡"
-                rev_label = "H1 BREAKOUT — SHORT"
-                chg_line  = f"1H: {r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
-                direction = "SHORT"
-                sl_label  = "SL (trên đỉnh)"
-
-            # Tính % thay đổi từ entry
-            def pct(target: float, entry: float) -> str:
-                if entry <= 0:
-                    return ""
-                return f"{(target - entry) / entry * 100:+.2f}%"
-
-            tp_block = ""
-            if r.entry > 0 and r.tp1 > 0:
-                tp_block = (
-                    f"📍 Entry: <b>{r.entry:.6g}</b> | {sl_label}: <b>{r.sl:.6g}</b>\n"
-                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) | R:R {r.rr_tp1:.1f}\n"
-                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) | R:R {r.rr_tp2:.1f}\n"
-                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
-                )
-
-            # M30 status
-            if r.m30_confirmed:
-                m30_tag = f"✅ M30: {r.m30_chg:+.2f}%"
-            elif r.m30_chg != 0:
-                m30_tag = f"⚠️ M30: {r.m30_chg:+.2f}%"
-            else:
-                m30_tag = ""
-
-            h1_tag = f"⏱️ H1 còn ~{r.h1_minutes_left}phút" if r.h1_minutes_left > 0 else "⏱️ H1 vừa đóng"
-
-            lines.append(
-                f"{rev_icon} <b>{rev_label}</b>\n"
-                f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
-                f"⚡ <b>{signal}</b>\n"
-                f"💰 {chg_line} | FR: {r.fr:.4f}%\n"
-                f"{m30_tag + ' | ' if m30_tag else ''}{h1_tag}"
-            )
-            if tp_block:
-                lines.append(tp_block)
-            lines.append("")
-    else:
-        lines.append("<i>Không có reversal signal trong giờ này.</i>\n")
 
     lines.append("⚠️ <i>Không phải lời khuyên đầu tư. Luôn đặt SL.</i>")
     return "\n".join(lines)
@@ -2661,6 +2925,616 @@ def job_reversal_only():
         log.error(f"job_reversal_only error: {e}", exc_info=True)
 
 
+def _score_candle(o: float, h: float, l: float, c: float,
+                  vol: float, vol_ma: float, label: str) -> tuple[float, str]:
+    """
+    Score 1 nến đơn theo chiều PUMP.
+    Trả về (score, direction_icon).
+    """
+    if o <= 0 or vol_ma <= 0:
+        return 0.0, "❓"
+    chg = (c - o) / o * 100
+    vr  = vol / vol_ma if vol_ma > 0 else 0
+    score = 0.0
+    if chg >= 20 and vr >= 2:   score = 3.0
+    elif chg >= 12 and vr >= 1.5: score = 2.5
+    elif chg >= 20:               score = 2.0
+    elif chg >= 12:               score = 1.5
+    elif chg >= 5:                score = 1.0
+    elif chg >= 2:                score = 0.5
+    elif chg >= -2:               score = 0.0   # sideway
+    elif chg >= -5:               score = -0.5
+    else:                         score = -1.0
+
+    if chg >= 2:    icon = "🟢"
+    elif chg >= -2: icon = "🟡"
+    else:           icon = "🔴"
+    return score, icon
+
+
+@dataclass
+class MTFResult:
+    """Kết quả scan đa khung D + H12 + H6."""
+    symbol:   str
+    exchange: str
+    # Scores từng khung
+    score_d:   float = 0
+    score_h12: float = 0
+    score_h6:  float = 0
+    # Icons từng khung
+    icon_d:   str = "❓"
+    icon_h12: str = "❓"
+    icon_h6:  str = "❓"
+    # Thay đổi % từng khung
+    chg_d:   float = 0
+    chg_h12: float = 0
+    chg_h6:  float = 0
+    # Vol ratio
+    vr_d:  float = 0
+    vr_h6: float = 0
+    # Data cho TP/SL
+    d_open:  float = 0
+    d_high:  float = 0
+    d_low:   float = 0
+    d_close: float = 0
+    # TP/SL
+    entry: float = 0
+    sl:    float = 0
+    tp1:   float = 0
+    tp2:   float = 0
+    tp3:   float = 0
+    # Tổng
+    mtf_score:   float = 0
+    green_count: int   = 0   # Số khung xanh / 3
+    signal_type: str   = ""
+    direction:   str   = "PUMP"
+
+    @property
+    def display_symbol(self) -> str:
+        s = self.symbol
+        if s.endswith("USDTM"): return s[:-5]
+        if s.endswith("USDT"):  return s[:-4]
+        return s
+
+
+def score_coin_mtf(exchange: str, symbol: str) -> Optional[MTFResult]:
+    """
+    Quét đa khung D + H12 + H6 cho 1 coin.
+    Trọng số: D=50%, H12=20%, H6=30%
+    Chỉ dùng cho daily scan 00:02 UTC.
+    """
+    candles_d = get_ohlcv(exchange, symbol, limit=25)
+    if not candles_d or len(candles_d) < 3:
+        return None
+
+    latest_d = candles_d[-1]
+    d_o = float(latest_d.get("o", 0)); d_h = float(latest_d.get("h", 0))
+    d_l = float(latest_d.get("l", 0)); d_c = float(latest_d.get("c", 0))
+    d_v = float(latest_d.get("v", 0))
+    if d_o <= 0 or d_c <= 0:
+        return None
+
+    prev_vols = [float(c.get("v", 0)) for c in candles_d[-11:-1]]
+    vol_ma_d  = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    if vol_ma_d <= 0:
+        return None
+
+    d_chg = (d_c - d_o) / d_o * 100
+    d_vr  = d_v / vol_ma_d
+
+    if abs(d_chg) < 5.0 and d_vr < 1.5:
+        return None
+
+    result = MTFResult(symbol=symbol, exchange=exchange)
+    result.d_open  = d_o; result.d_high  = d_h
+    result.d_low   = d_l; result.d_close = d_c
+    result.chg_d   = round(d_chg, 2)
+    result.vr_d    = round(d_vr, 2)
+    result.direction = "PUMP" if d_chg >= 0 else "DUMP"
+
+    score_d, icon_d = _score_candle(d_o, d_h, d_l, d_c, d_v, vol_ma_d, "D")
+    result.score_d = score_d; result.icon_d = icon_d
+
+    # ── H12 ──────────────────────────────────────────────────────
+    candles_h12 = get_ohlcv_h12(exchange, symbol, limit=6)
+    if candles_h12 and len(candles_h12) >= 3:
+        h12 = candles_h12[-1]
+        h12_vols = [float(c.get("v", 0)) for c in candles_h12[-4:-1]]
+        h12_ma   = sum(h12_vols) / len(h12_vols) if h12_vols else 0
+        s, ic = _score_candle(float(h12.get("o",0)), float(h12.get("h",0)),
+                               float(h12.get("l",0)), float(h12.get("c",0)),
+                               float(h12.get("v",0)), h12_ma, "H12")
+        result.score_h12 = s; result.icon_h12 = ic
+        o12 = float(h12.get("o", 1))
+        result.chg_h12 = round((float(h12.get("c",o12)) - o12) / o12 * 100, 2) if o12 > 0 else 0
+
+    # ── H6 ───────────────────────────────────────────────────────
+    candles_h6 = get_ohlcv_h6(exchange, symbol, limit=8)
+    if candles_h6 and len(candles_h6) >= 3:
+        h6 = candles_h6[-1]
+        h6_vols = [float(c.get("v", 0)) for c in candles_h6[-5:-1]]
+        h6_ma   = sum(h6_vols) / len(h6_vols) if h6_vols else 0
+        s, ic = _score_candle(float(h6.get("o",0)), float(h6.get("h",0)),
+                               float(h6.get("l",0)), float(h6.get("c",0)),
+                               float(h6.get("v",0)), h6_ma, "H6")
+        result.score_h6 = s; result.icon_h6 = ic
+        result.vr_h6    = round(float(h6.get("v",0)) / h6_ma, 2) if h6_ma > 0 else 0
+        o6 = float(h6.get("o", 1))
+        result.chg_h6   = round((float(h6.get("c",o6)) - o6) / o6 * 100, 2) if o6 > 0 else 0
+
+    # ── MTF score: D=50%, H12=20%, H6=30% ────────────────────────
+    result.mtf_score = round(
+        result.score_d   * 0.50 +
+        result.score_h12 * 0.20 +
+        result.score_h6  * 0.30,
+        2
+    )
+
+    # Đếm số khung cùng chiều (3 khung)
+    if result.direction == "PUMP":
+        result.green_count = sum(1 for ic in [result.icon_d, result.icon_h12, result.icon_h6] if ic == "🟢")
+    else:
+        result.green_count = sum(1 for ic in [result.icon_d, result.icon_h12, result.icon_h6] if ic == "🔴")
+
+    # Cần ít nhất 2/3 khung cùng chiều
+    if result.green_count < 2:
+        return None
+
+    # ── TP / SL từ range nến D ────────────────────────────────────
+    d_range = d_h - d_l
+    if d_range > 0:
+        result.entry = round(d_c, 8)
+        if result.direction == "PUMP":
+            result.sl  = round(d_l - d_range * 0.1, 8)
+            result.tp1 = round(d_c + d_range * 0.5,   8)
+            result.tp2 = round(d_c + d_range * 1.0,   8)
+            result.tp3 = round(d_c + d_range * 1.618, 8)
+        else:
+            result.sl  = round(d_h + d_range * 0.1, 8)
+            result.tp1 = round(d_c - d_range * 0.5,   8)
+            result.tp2 = round(d_c - d_range * 1.0,   8)
+            result.tp3 = round(d_c - d_range * 1.618, 8)
+
+    # Signal label
+    gc = result.green_count
+    if gc == 3:
+        result.signal_type = "🔥 3/3 KHUNG — MUA MẠNH NHẤT" if result.direction == "PUMP" else "🔥 3/3 KHUNG — SHORT MẠNH NHẤT"
+    else:
+        result.signal_type = "✅ 2/3 KHUNG — MUA TỐT" if result.direction == "PUMP" else "✅ 2/3 KHUNG — SHORT TỐT"
+
+    return result
+
+
+def run_mtf_scan() -> tuple[list[MTFResult], list[MTFResult]]:
+    """
+    Quét đa khung 4 sàn song song.
+    Trả về (pump_top2, dump_top2).
+    """
+    all_pump: list[MTFResult] = []
+    all_dump:  list[MTFResult] = []
+    scan_start = time.time()
+
+    def _scan_exchange_mtf(exchange: str) -> list[MTFResult]:
+        symbols = get_all_symbols(exchange)
+        if not symbols:
+            return []
+        workers = (MAX_WORKERS_BINANCE if exchange == "Binance"
+                   else MAX_WORKERS_BINGX if exchange == "BingX"
+                   else MAX_WORKERS_KUCOIN if exchange == "KuCoin"
+                   else MAX_WORKERS_BYBIT)
+        log.info(f"📅 MTF scan {exchange}: {len(symbols)} symbols...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fmap = {executor.submit(score_coin_mtf, exchange, s): s for s in symbols}
+            for future in as_completed(fmap):
+                try:
+                    r = future.result()
+                    if r:
+                        results.append(r)
+                except Exception as e:
+                    log.debug(f"MTF {exchange} {fmap[future]}: {e}")
+        log.info(f"✅ MTF {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
+
+    # 4 sàn song song
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        futures = {ex_pool.submit(_scan_exchange_mtf, ex): ex for ex in SCAN_EXCHANGES}
+        for future in as_completed(futures):
+            try:
+                for r in future.result():
+                    if r.direction == "PUMP":
+                        all_pump.append(r)
+                    else:
+                        all_dump.append(r)
+            except Exception as e:
+                log.error(f"MTF scan error: {e}")
+
+    # Dedup
+    def dedup_mtf(lst: list[MTFResult]) -> list[MTFResult]:
+        seen: dict[str, MTFResult] = {}
+        # Sort: green_count cao trước, rồi abs(mtf_score) cao trước
+        for r in sorted(lst, key=lambda x: (x.green_count, abs(x.mtf_score)), reverse=True):
+            base = r.symbol.upper()
+            if base.endswith("USDTM"): base = base[:-1]
+            if base not in seen:
+                seen[base] = r
+        return list(seen.values())
+
+    unique_pump = dedup_mtf(all_pump)
+    unique_dump = dedup_mtf(all_dump)
+
+    # Sort pump: green_count cao → mtf_score cao
+    unique_pump.sort(key=lambda x: (x.green_count, x.mtf_score), reverse=True)
+    # Sort dump: green_count cao → mtf_score âm nhất (abs cao nhất) = dump mạnh nhất
+    unique_dump.sort(key=lambda x: (x.green_count, abs(x.mtf_score)), reverse=True)
+
+    log.info(f"📅 MTF scan xong: {time.time()-scan_start:.1f}s | pump {len(unique_pump)} | dump {len(unique_dump)}")
+    return unique_pump[:1], unique_dump[:1]
+
+
+def format_mtf_alert(pump_list: list[MTFResult], dump_list: list[MTFResult]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"📅 <b>DAILY MTF SCAN — {now}</b>\n"]
+
+    def fmt_coin(r: MTFResult, section_icon: str, section_label: str) -> None:
+        sym = html.escape(r.display_symbol)
+        def pct(t, e):
+            if e <= 0: return ""
+            return f"{(t-e)/e*100:+.2f}%"
+        lines.append(f"{'═'*27}")
+        lines.append(f"{section_icon} <b>{section_label}</b>")
+        lines.append(f"{'═'*27}\n")
+        lines.append(
+            f"<b>{sym}</b> — <b>{r.mtf_score:.2f}đ</b> | {r.green_count}/3 khung\n"
+            f"⚡ <b>{html.escape(r.signal_type)}</b>\n"
+            f"D: {r.icon_d}{r.chg_d:+.1f}% | H12: {r.icon_h12}{r.chg_h12:+.1f}% | H6: {r.icon_h6}{r.chg_h6:+.1f}%\n"
+            f"Vol D: {r.vr_d:.1f}x | Vol H6: {r.vr_h6:.1f}x"
+        )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
+                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+            )
+        lines.append("")
+
+    if pump_list:
+        fmt_coin(pump_list[0], "🚀", "TOP MUA NGÀY HÔM NAY")
+    else:
+        lines.append(f"{'═'*27}\n🚀 <b>TOP MUA NGÀY HÔM NAY</b>\n{'═'*27}\n")
+        lines.append("<i>Không có signal pump đủ 2/3 khung.</i>\n")
+
+    if dump_list:
+        fmt_coin(dump_list[0], "📉", "TOP SHORT/DUMP NGÀY HÔM NAY")
+    else:
+        lines.append(f"{'═'*27}\n📉 <b>TOP SHORT/DUMP NGÀY HÔM NAY</b>\n{'═'*27}\n")
+        lines.append("<i>Không có signal dump đủ 2/3 khung.</i>\n")
+
+    lines.append("⚠️ <i>Không phải lời khuyên đầu tư. Luôn đặt SL.</i>")
+    return "\n".join(lines)
+
+
+# ── daily_watch.json — track coin để HOLD/OUT check ──────────
+
+DAILY_WATCH_FILE = "daily_watch.json"
+
+def save_daily_watch(pump: list[MTFResult], dump: list[MTFResult]) -> None:
+    import os, json as _json
+    os.makedirs("results", exist_ok=True)
+    data = {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "pump": [{"symbol": r.symbol, "exchange": r.exchange,
+                  "entry": r.entry, "sl": r.sl,
+                  "tp1": r.tp1, "tp2": r.tp2, "tp3": r.tp3,
+                  "d_high": r.d_high, "d_low": r.d_low,
+                  "mtf_score": r.mtf_score, "green_count": r.green_count} for r in pump],
+        "dump": [{"symbol": r.symbol, "exchange": r.exchange,
+                  "entry": r.entry, "sl": r.sl,
+                  "tp1": r.tp1, "tp2": r.tp2, "tp3": r.tp3,
+                  "d_high": r.d_high, "d_low": r.d_low,
+                  "mtf_score": r.mtf_score, "green_count": r.green_count} for r in dump],
+    }
+    with open(f"results/{DAILY_WATCH_FILE}", "w") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+    log.info(f"💾 Daily watch saved: pump {len(pump)} | dump {len(dump)}")
+
+
+def load_daily_watch() -> dict:
+    import json as _json
+    try:
+        with open(f"results/{DAILY_WATCH_FILE}") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def job_daily_mtf():
+    """00:02 UTC — Quét MTF, alert top 2 pump + dump, lưu watch list."""
+    try:
+        log.info("📅 Daily MTF scan bắt đầu...")
+        pump, dump = run_mtf_scan()
+
+        if not pump and not dump:
+            log.info("📅 Không có MTF signal đủ điều kiện.")
+            send_telegram("📅 Daily MTF scan xong — không có signal đủ 2/4 khung.")
+            return
+
+        log.info(f"📅 MTF results: pump {len(pump)} | dump {len(dump)}")
+        for r in pump:
+            log.info(f"  🟢 {r.display_symbol} {r.green_count}/3 {r.mtf_score:.2f}đ D:{r.chg_d:+.1f}% H6:{r.chg_h6:+.1f}%")
+        for r in dump:
+            log.info(f"  🔴 {r.display_symbol} {r.green_count}/3 {r.mtf_score:.2f}đ D:{r.chg_d:+.1f}% H6:{r.chg_h6:+.1f}%")
+
+        save_daily_watch(pump, dump)
+        msg = format_mtf_alert(pump, dump)
+        if send_telegram(msg):
+            log.info("✅ Daily MTF alert đã gửi!")
+        else:
+            log.error("❌ Gửi Daily MTF alert thất bại!")
+
+    except Exception as e:
+        log.error(f"job_daily_mtf error: {e}", exc_info=True)
+        send_telegram(f"❌ Daily MTF error: {html.escape(str(e))}")
+
+
+def job_hold_check():
+    """
+    04:02, 08:02, 12:02, 16:02, 20:02 UTC — Check HOLD/OUT cho coin đã alert.
+    Dựa trên nến H4 mới nhất.
+    """
+    watch = load_daily_watch()
+    if not watch or (not watch.get("pump") and not watch.get("dump")):
+        log.info("🔍 Hold check: không có coin trong watch list.")
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if watch.get("date") != today:
+        log.info(f"🔍 Hold check: watch list ngày {watch.get('date')} ≠ hôm nay {today} — bỏ qua.")
+        return
+
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines   = [f"🔍 <b>HOLD/OUT CHECK — {now_str}</b>\n"]
+    has_signal = False
+
+    def check_coin(item: dict, direction: str) -> Optional[str]:
+        symbol   = item["symbol"]
+        exchange = item["exchange"]
+        entry    = item["entry"]
+        sl       = item["sl"]
+        tp1      = item["tp1"]
+        tp2      = item["tp2"]
+        tp3      = item["tp3"]
+
+        # Lấy nến H6 mới nhất (check mỗi 6H nên dùng H6)
+        h6_candles = get_ohlcv_h6(exchange, symbol, limit=6)
+        if not h6_candles or len(h6_candles) < 3:
+            return None
+
+        h6 = h6_candles[-1]
+        h6_o = float(h6.get("o", 0)); h6_c = float(h6.get("c", 0))
+        h6_h = float(h6.get("h", 0)); h6_l = float(h6.get("l", 0))
+        h6_v = float(h6.get("v", 0))
+        h6_vols = [float(c.get("v", 0)) for c in h6_candles[-4:-1]]
+        h6_ma   = sum(h6_vols) / len(h6_vols) if h6_vols else 1
+        h6_chg  = (h6_c - h6_o) / h6_o * 100 if h6_o > 0 else 0
+        h6_vr   = h6_v / h6_ma if h6_ma > 0 else 0
+
+        cur_price = h6_c
+        pnl = (cur_price - entry) / entry * 100 if entry > 0 else 0
+        if direction == "DUMP": pnl = -pnl
+
+        # TP/SL check — dùng H6 high/low để bắt TP chính xác hơn
+        check_price_high = h6_h if direction == "PUMP" else h6_l
+        check_price_low  = h6_l if direction == "PUMP" else h6_h
+
+        def pct(t, e): return f"{(t-e)/e*100:+.2f}%" if e > 0 else ""
+
+        # Xác định verdict
+        if direction == "PUMP":
+            if check_price_high >= tp3 and tp3 > 0:
+                verdict = f"🎯🎯🎯 TP3 HIT! ({pct(tp3, entry)})"
+                urgent  = True
+            elif check_price_high >= tp2 and tp2 > 0:
+                verdict = f"🎯🎯 TP2 HIT! ({pct(tp2, entry)}) — Cân nhắc chốt"
+                urgent  = True
+            elif check_price_high >= tp1 and tp1 > 0:
+                verdict = f"🎯 TP1 HIT ({pct(tp1, entry)}) — Di SL lên entry"
+                urgent  = True
+            elif check_price_low <= sl:
+                verdict = f"🛑 SL HIT ({pct(sl, entry)})"
+                urgent  = True
+            elif h6_chg <= -3 and h6_vr >= 1.5:
+                verdict = f"⚠️ OUT — H6 đỏ {h6_chg:.1f}% vol {h6_vr:.1f}x"
+                urgent  = True
+            elif h6_chg >= 2 and h6_vr >= 1.2:
+                verdict = f"✅ HOLD — H6 {h6_chg:+.1f}% vol {h6_vr:.1f}x"
+                urgent  = False
+            else:
+                verdict = f"✅ HOLD — Chờ (H6 {h6_chg:+.1f}%)"
+                urgent  = False
+        else:  # DUMP
+            if check_price_low <= tp3 and tp3 > 0:
+                verdict = f"🎯🎯🎯 TP3 HIT! ({pct(tp3, entry)})"
+                urgent  = True
+            elif check_price_low <= tp2 and tp2 > 0:
+                verdict = f"🎯🎯 TP2 HIT! ({pct(tp2, entry)})"
+                urgent  = True
+            elif check_price_low <= tp1 and tp1 > 0:
+                verdict = f"🎯 TP1 HIT ({pct(tp1, entry)})"
+                urgent  = True
+            elif check_price_high >= sl:
+                verdict = f"🛑 SL HIT ({pct(sl, entry)})"
+                urgent  = True
+            elif h6_chg >= 3 and h6_vr >= 1.5:
+                verdict = f"⚠️ OUT — H6 xanh {h6_chg:+.1f}% vol {h6_vr:.1f}x"
+                urgent  = True
+            else:
+                verdict = f"✅ HOLD — H6 {h6_chg:+.1f}%"
+                urgent  = False
+
+        sym = symbol[:-5] if symbol.endswith("USDTM") else symbol[:-4] if symbol.endswith("USDT") else symbol
+        icon = "🟢" if direction == "PUMP" else "🔴"
+        return (
+            f"{icon} <b>{sym}</b> {direction} | PnL: <b>{pnl:+.2f}%</b>\n"
+            f"{verdict}\n"
+            f"Giá: {cur_price:.6g} | TP1:{tp1:.6g} TP2:{tp2:.6g} TP3:{tp3:.6g}"
+        ), urgent
+
+    urgent_lines = []
+    for item in watch.get("pump", []):
+        try:
+            result = check_coin(item, "PUMP")
+            if result:
+                msg_text, urgent = result
+                lines.append(msg_text); lines.append("")
+                if urgent: urgent_lines.append(msg_text)
+                has_signal = True
+        except Exception as e:
+            log.debug(f"Hold check pump {item.get('symbol')}: {e}")
+
+    for item in watch.get("dump", []):
+        try:
+            result = check_coin(item, "DUMP")
+            if result:
+                msg_text, urgent = result
+                lines.append(msg_text); lines.append("")
+                if urgent: urgent_lines.append(msg_text)
+                has_signal = True
+        except Exception as e:
+            log.debug(f"Hold check dump {item.get('symbol')}: {e}")
+
+    if not has_signal:
+        log.info("🔍 Hold check: không lấy được H6 data.")
+        return
+
+    msg = "\n".join(lines)
+    if send_telegram(msg):
+        log.info("✅ Hold check alert đã gửi!")
+    else:
+        log.error("❌ Hold check gửi thất bại!")
+
+    # Gửi thêm alert riêng nếu có TP hit
+    if urgent_lines:
+        urgent_msg = "🚨 <b>URGENT — TP/SL HIT!</b>\n\n" + "\n\n".join(urgent_lines)
+        send_telegram(urgent_msg)
+        log.info(f"🚨 Urgent alert gửi: {len(urgent_lines)} signal(s)")
+
+
+def run_h2_scan() -> tuple[list[ScoreResult], list[ScoreResult]]:
+    """Quét H2 song song 4 sàn. Trả về (pump_top1, dump_top1)."""
+    all_pump: list[ScoreResult] = []
+    all_dump:  list[ScoreResult] = []
+    scan_start = time.time()
+
+    def _scan_exchange_h2(exchange: str) -> list[ScoreResult]:
+        symbols = get_all_symbols(exchange)
+        if not symbols: return []
+        workers = (MAX_WORKERS_BINANCE if exchange == "Binance"
+                   else MAX_WORKERS_BINGX if exchange == "BingX"
+                   else MAX_WORKERS_KUCOIN if exchange == "KuCoin"
+                   else MAX_WORKERS_BYBIT)
+        log.info(f"⚡ H2 scan {exchange}: {len(symbols)} symbols...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fmap = {executor.submit(score_coin_h2, exchange, s): s for s in symbols}
+            for future in as_completed(fmap):
+                try:
+                    r = future.result()
+                    if r: results.append(r)
+                except Exception as e:
+                    log.debug(f"H2 {exchange} {fmap[future]}: {e}")
+        log.info(f"✅ H2 {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        futures = {ex_pool.submit(_scan_exchange_h2, ex): ex for ex in SCAN_EXCHANGES}
+        for future in as_completed(futures):
+            try:
+                for r in future.result():
+                    if "PUMP" in r.market_mode:
+                        all_pump.append(r)
+                    else:
+                        all_dump.append(r)
+            except Exception as e:
+                log.error(f"H2 scan error: {e}")
+
+    # Dedup
+    def dedup_h2(lst: list[ScoreResult]) -> list[ScoreResult]:
+        seen: dict[str, ScoreResult] = {}
+        for r in sorted(lst, key=lambda x: x.total_score, reverse=True):
+            base = r.symbol.upper()
+            if base.endswith("USDTM"): base = base[:-1]
+            if base not in seen: seen[base] = r
+        return list(seen.values())
+
+    pumps = dedup_h2(all_pump)
+    dumps = dedup_h2(all_dump)
+    pumps.sort(key=lambda x: x.total_score, reverse=True)
+    dumps.sort(key=lambda x: x.total_score, reverse=True)
+
+    log.info(f"⚡ H2 scan xong: {time.time()-scan_start:.1f}s | pump {len(pumps)} | dump {len(dumps)}")
+    return pumps[:1], dumps[:1]
+
+
+def format_h2_alert(pump: list[ScoreResult], dump: list[ScoreResult]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"⚡ <b>H2 SCAN — {now}</b>\n"]
+
+    def fmt_r(r: ScoreResult, section: str) -> None:
+        sym    = html.escape(r.display_symbol)
+        signal = html.escape(r.signal_type)
+        icon   = "🟢" if "PUMP" in r.market_mode else "🔴"
+
+        def pct(t, e):
+            if e <= 0: return ""
+            return f"{(t-e)/e*100:+.2f}%"
+
+        lines.append(f"{'═'*27}")
+        lines.append(f"{icon} <b>{section}</b>")
+        lines.append(f"{'═'*27}\n")
+        lines.append(
+            f"<b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"⚡ <b>{signal}</b>\n"
+            f"H2: {r.price_chg:+.2f}% | Vol: {r.vol_ratio:.1f}x | "
+            f"OI: {r.oi_chg_pct:+.1f}% | FR: {r.fr:.4f}%"
+        )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
+                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+            )
+        lines.append("")
+
+    if pump:
+        fmt_r(pump[0], "H2 PUMP — MUA NGẮN HẠN")
+    if dump:
+        fmt_r(dump[0], "H2 DUMP — SHORT NGẮN HẠN")
+    if not pump and not dump:
+        lines.append("<i>Không có H2 signal đủ điều kiện.</i>")
+
+    lines.append("⚠️ <i>Target 15-30%. Luôn đặt SL chặt.</i>")
+    return "\n".join(lines)
+
+
+def job_h2_scan():
+    """Chạy mỗi 2H — scan H2 pump/dump, alert nếu có signal."""
+    try:
+        pump, dump = run_h2_scan()
+        if not pump and not dump:
+            log.info("⚡ H2 scan xong — không có signal.")
+            return
+        msg = format_h2_alert(pump, dump)
+        if send_telegram(msg):
+            log.info(f"✅ H2 alert gửi: pump {len(pump)} dump {len(dump)}")
+        else:
+            log.error("❌ H2 alert gửi thất bại!")
+    except Exception as e:
+        log.error(f"job_h2_scan error: {e}", exc_info=True)
+
+
 def job():
     try:
         pump_results, dump_results, rev_results = run_scan()
@@ -2758,123 +3632,99 @@ if __name__ == "__main__":
 
         from datetime import timedelta
 
-        FULL_SCAN_MINUTE = 2    # Full scan lúc xx:02 UTC (mọi giờ)
-        REV_SCAN_MINUTE  = 32   # Reversal scan lúc xx:32 UTC
-        CHECK_SLEEP      = 30   # Kiểm tra lại mỗi 30 giây
+        FULL_SCAN_MINUTE = 2
+        REV_SCAN_MINUTE  = 32
+        CHECK_SLEEP      = 30
+        HOLD_CHECK_HOURS = {6, 12, 18}      # Hold/Out check mỗi 6H
+        H2_SCAN_HOURS_SET = set(range(2, 24, 2))  # 02,04,06...22 UTC — H2 scan mỗi 2H
 
-        def next_slot_utc(now: datetime | None = None) -> tuple[datetime, str]:
-            """
-            Trả về (thời điểm slot kế tiếp, loại slot).
-            Loại: 'daily' | 'full' | 'reversal'
-
-            Ưu tiên:
-              00:02 UTC → 'daily'  (full 1D scan chính thức sau khi nến ngày đóng)
-              xx:02 UTC → 'full'   (mọi giờ còn lại)
-              xx:32 UTC → 'reversal'
-            """
+        def next_slot_utc(now=None):
             now = now or datetime.now(timezone.utc)
             base = now.replace(second=0, microsecond=0)
+            candidates = []
 
-            # Slot daily: 00:02 UTC
-            slot_daily = base.replace(hour=DAILY_SCAN_HOUR, minute=FULL_SCAN_MINUTE)
-            if slot_daily <= now:
-                slot_daily += timedelta(days=1)
+            # daily 00:02 UTC
+            s = base.replace(hour=0, minute=FULL_SCAN_MINUTE)
+            if s <= now: s += timedelta(days=1)
+            candidates.append((s, "daily"))
 
-            # Slot full: xx:02 UTC (giờ hiện tại hoặc kế tiếp, không phải 00:xx)
-            slot_full = base.replace(minute=FULL_SCAN_MINUTE)
-            if slot_full <= now:
-                slot_full += timedelta(hours=1)
-            # Nếu slot_full trùng với slot_daily → bỏ slot_full (daily thay thế)
-            if slot_full == slot_daily:
-                slot_full += timedelta(hours=1)
+            # hold check 06:02, 12:02, 18:02 UTC
+            for h in HOLD_CHECK_HOURS:
+                s = base.replace(hour=h, minute=FULL_SCAN_MINUTE)
+                if s <= now: s += timedelta(days=1)
+                candidates.append((s, "hold_check"))
 
-            # Slot reversal: xx:32 UTC
-            slot_rev = base.replace(minute=REV_SCAN_MINUTE)
-            if slot_rev <= now:
-                slot_rev += timedelta(hours=1)
+            # H2 scan 02:02, 04:02, 06:02... 22:02 UTC
+            for h in H2_SCAN_HOURS_SET:
+                s = base.replace(hour=h, minute=FULL_SCAN_MINUTE)
+                if s <= now: s += timedelta(days=1)
+                candidates.append((s, "h2_scan"))
 
-            candidates = [
-                (slot_daily, "daily"),
-                (slot_full,  "full"),
-                (slot_rev,   "reversal"),
-            ]
+            # full scan: xx:02 các giờ lẻ không trùng daily/hold/h2
+            occupied = {0} | HOLD_CHECK_HOURS | H2_SCAN_HOURS_SET
+            s = base.replace(minute=FULL_SCAN_MINUTE)
+            if s <= now: s += timedelta(hours=1)
+            while s.hour in occupied:
+                s += timedelta(hours=1)
+            candidates.append((s, "full"))
+
             candidates.sort(key=lambda x: x[0])
             return candidates[0]
 
-        def slot_id(dt: datetime, kind: str) -> str:
+        def slot_id(dt, kind):
             return f"{dt.strftime('%Y%m%d%H%M')}_{kind}"
 
-        log.info("⏰ SCHEDULER V3 khởi động")
-        log.info(f"   00:{FULL_SCAN_MINUTE:02d} UTC → DAILY scan (1D chính thức sau nến ngày đóng)")
-        log.info(f"   xx:{FULL_SCAN_MINUTE:02d} UTC → Full scan (PUMP + DUMP + REVERSAL, mỗi giờ)")
-        if ENABLE_30MIN_SCAN:
-            log.info(f"   xx:{REV_SCAN_MINUTE:02d} UTC → Reversal scan (1H + M30 + H1 Breakout)")
-        log.info("   Chạy '--now' để test full scan ngay")
+        log.info("⏰ SCHEDULER V5 khởi động")
+        log.info("   00:02 UTC           → DAILY MTF scan (D+H12+H6 — 1 lần/ngày)")
+        log.info("   02/04/06...22:02    → H2 scan (pump/dump H2 — mỗi 2H)")
+        log.info("   06/12/18:02 UTC     → HOLD/OUT check (H6 — mỗi 6H)")
+        log.info("   xx:02 giờ lẻ        → Full scan 1D (mỗi giờ còn lại)")
 
-        last_executed_slot: str = ""
+        last_executed_slot = ""
 
         while True:
             target, slot_kind = next_slot_utc()
 
-            # Chờ tới đúng slot
             while True:
                 now = datetime.now(timezone.utc)
                 wait = (target - now).total_seconds()
-                if wait <= 0:
-                    break
-                kind_label = {"daily": "Daily 1D scan", "full": "Full scan", "reversal": "Reversal scan"}.get(slot_kind, slot_kind)
-                log.info(f"⏳ Đợi {wait/60:.1f} phút đến {target.strftime('%H:%M UTC')} ({kind_label})...")
+                if wait <= 0: break
+                labels = {"daily":"Daily MTF","hold_check":"Hold/Out","full":"Full scan","reversal":"Reversal"}
+                log.info(f"⏳ Đợi {wait/60:.1f}p đến {target.strftime('%H:%M UTC')} ({labels.get(slot_kind,slot_kind)})...")
                 time.sleep(min(wait, CHECK_SLEEP))
 
-            # Anti-duplicate
             current_slot = slot_id(target, slot_kind)
             if current_slot == last_executed_slot:
-                log.warning(f"⚠️ Slot {current_slot} đã chạy rồi — bỏ qua")
-                time.sleep(60)
-                continue
+                log.warning(f"⚠️ Slot {current_slot} đã chạy — bỏ qua")
+                time.sleep(60); continue
 
             scan_start_dt = datetime.now(timezone.utc)
             scan_start    = time.time()
             last_executed_slot = current_slot
 
-            if slot_kind == "daily":
-                log.info(f"📅 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Daily 1D scan bắt đầu...")
-                try:
-                    job()   # Full scan bình thường — nến ngày vừa đóng lúc 00:00
-                except Exception as e:
-                    log.error(f"Daily scan error: {e}", exc_info=True)
-                    try:
-                        send_telegram(f"❌ Daily scan error: {html.escape(str(e))}")
-                    except Exception:
-                        pass
-
-            elif slot_kind == "full":
-                log.info(f"🚀 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Full scan bắt đầu...")
-                try:
+            try:
+                if slot_kind == "daily":
+                    log.info(f"📅 [{scan_start_dt.strftime('%H:%M UTC')}] Daily MTF scan...")
+                    job_daily_mtf()
+                elif slot_kind == "hold_check":
+                    log.info(f"🔍 [{scan_start_dt.strftime('%H:%M UTC')}] Hold/Out check...")
+                    job_hold_check()
+                elif slot_kind == "h2_scan":
+                    log.info(f"⚡ [{scan_start_dt.strftime('%H:%M UTC')}] H2 scan...")
+                    job_h2_scan()
+                elif slot_kind == "full":
+                    log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan 1D...")
                     job()
-                except Exception as e:
-                    log.error(f"Full scan error: {e}", exc_info=True)
-                    try:
-                        send_telegram(f"❌ Scanner error: {html.escape(str(e))}")
-                    except Exception:
-                        pass
-
-            else:  # reversal
-                if ENABLE_30MIN_SCAN:
-                    log.info(f"🔄 [{scan_start_dt.strftime('%Y-%m-%d %H:%M UTC')}] Reversal scan bắt đầu...")
-                    try:
-                        job_reversal_only()
-                    except Exception as e:
-                        log.error(f"Reversal scan error: {e}", exc_info=True)
                 else:
-                    log.info(f"⏭️  Bỏ qua reversal slot (ENABLE_30MIN_SCAN=False)")
+                    pass  # Reversal scan đã tắt
+            except Exception as e:
+                log.error(f"Scheduler [{slot_kind}]: {e}", exc_info=True)
+                try: send_telegram(f"❌ [{slot_kind}] error: {html.escape(str(e))}")
+                except Exception: pass
 
             elapsed     = time.time() - scan_start
             finished_dt = datetime.now(timezone.utc)
             next_target, next_kind = next_slot_utc(finished_dt)
-            next_label  = {"daily": "Daily", "full": "Full", "reversal": "Reversal"}.get(next_kind, next_kind)
-
-            log.info(
-                f"✅ Xong trong {elapsed:.0f}s — "
-                f"slot tiếp theo: {next_target.strftime('%H:%M UTC')} ({next_label})"
-            )
+            labels = {"daily":"Daily MTF","hold_check":"Hold/Out",
+                      "h2_scan":"H2 Scan","full":"Full 1D"}
+            log.info(f"✅ Xong {elapsed:.0f}s — tiếp theo: {next_target.strftime('%H:%M UTC')} ({labels.get(next_kind,next_kind)})")
