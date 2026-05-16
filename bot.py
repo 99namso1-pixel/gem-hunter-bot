@@ -2797,6 +2797,10 @@ def send_telegram(message: str) -> bool:
 
 def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult],
                  rev_results: list[ScoreResult]) -> str:
+    """Telegram alert gọn: chỉ hiện section nào có signal.
+    Nếu TOP PUMP / DUMP / REVERSAL trống thì bỏ hẳn section đó, không in dòng trống.
+    Đồng thời tách Entry Now và Entry Limit để tránh hiểu nhầm market entry / limit entry.
+    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"🚀📉 <b>PUMP &amp; DUMP SCANNER V7</b>",
@@ -2804,128 +2808,133 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
         f"📊 Quét: {' | '.join(SCAN_EXCHANGES)} — 1D + 1H\n",
     ]
 
-    # ── PUMP SECTION ──────────────────────────────────────────────
-    lines.append("═══════════════════════════")
-    lines.append("🚀 <b>TOP PUMP — CÓ THỂ TĂNG MẠNH (1D)</b>")
-    lines.append("═══════════════════════════\n")
+    def fmt_price(v: float) -> str:
+        return f"{v:.6g}" if v and v > 0 else "-"
 
-    pump_rank_styles = [
-        ("🟢🥇", "TOP 1 PUMP — ƯU TIÊN MẠNH"),
-        ("🟡🥈", "TOP 2 PUMP — THEO DÕI"),
-    ]
+    def pct(t: float, e: float) -> str:
+        if e <= 0:
+            return ""
+        return f"{(t - e) / e * 100:+.2f}%"
 
+    def entry_block(r: ScoreResult, side: str) -> str:
+        """Tách Entry Now / Entry Limit.
+        - Entry Now = giá hiện tại, chỉ OK nếu không lệch quá xa ideal entry.
+        - Entry Limit = entry chiến lược/retest.
+        """
+        current = r.price_current or 0
+        limit_entry = r.entry or current
+        dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
+
+        now_line = f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
+        if dist_pct > 3.0:
+            now_line = f"⚡ Entry Now: <b>Không chase</b>"
+
+        if side == "LONG":
+            limit_label = "🎯 Entry Limit"
+        else:
+            limit_label = "🎯 Entry Limit"
+
+        return (
+            f"{now_line}\n"
+            f"{limit_label}: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
+        )
+
+    # ── PUMP SECTION: chỉ hiện khi có kết quả ───────────────────
     if pump_results:
+        lines.append("═══════════════════════════")
+        lines.append("🚀 <b>TOP PUMP — CÓ THỂ TĂNG MẠNH (1D)</b>")
+        lines.append("═══════════════════════════\n")
+
+        pump_rank_styles = [
+            ("🟢🥇", "TOP 1 PUMP — ƯU TIÊN MẠNH"),
+            ("🟡🥈", "TOP 2 PUMP — THEO DÕI"),
+        ]
+
         for i, r in enumerate(pump_results[:2]):
             badge, rank_name = pump_rank_styles[i] if i < len(pump_rank_styles) else ("⭐", "WATCHLIST")
-            if r.market_mode == "SQUEEZE":
-                mode_icon = "🔴"
-            elif r.market_mode == "TREND":
-                mode_icon = "🟢"
-            elif r.market_mode == "HYBRID":
-                mode_icon = "🟣"
-            else:
-                mode_icon = "⚡"
-
-            symbol   = html.escape(r.display_symbol)   # "BTC" không có sàn
-            signal   = html.escape(str(r.signal_type))
+            symbol = html.escape(r.display_symbol)
             engine_info = ""
             if r.market_mode in ("SQUEEZE", "HYBRID"):
                 engine_info = f" | 🔴SQ:{r.squeeze_engine_score:.1f}"
             elif r.market_mode == "TREND":
                 engine_info = f" | 🟢TR:{r.trend_score:.1f}"
 
-            def pct(t, e):
-                if e <= 0: return ""
-                return f"{(t-e)/e*100:+.2f}%"
-
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{engine_info}\n"
                 f"🟢 <b>KHUYẾN NGHỊ LONG</b>\n"
-                f"💰 Giá: <b>{r.price_current:.6g}</b> | +{r.price_chg:.2f}%"
+                f"💰 Giá: <b>{fmt_price(r.price_current)}</b> | +{r.price_chg:.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
-                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
-                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
-                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                    f"{entry_block(r, 'LONG')}\n"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
-    else:
-        lines.append("<i>Không tìm thấy coin pump đủ điều kiện.</i>\n")
 
-    # ── DUMP SECTION ──────────────────────────────────────────────
-    lines.append("═══════════════════════════")
-    lines.append("📉 <b>TOP DUMP — CÓ THỂ GIẢM MẠNH (1D)</b>")
-    lines.append("═══════════════════════════\n")
-
-    dump_rank_styles = [
-        ("🔴🥇", "TOP 1 DUMP — CẨN THẬN CAO"),
-        ("🟠🥈", "TOP 2 DUMP — THEO DÕI"),
-    ]
-
+    # ── DUMP SECTION: chỉ hiện khi có kết quả ───────────────────
     if dump_results:
+        lines.append("═══════════════════════════")
+        lines.append("📉 <b>TOP DUMP — CÓ THỂ GIẢM MẠNH (1D)</b>")
+        lines.append("═══════════════════════════\n")
+
+        dump_rank_styles = [
+            ("🔴🥇", "TOP 1 DUMP — CẨN THẬN CAO"),
+            ("🟠🥈", "TOP 2 DUMP — THEO DÕI"),
+        ]
+
         for i, r in enumerate(dump_results[:2]):
             badge, rank_name = dump_rank_styles[i] if i < len(dump_rank_styles) else ("⭐", "WATCHLIST")
-            symbol   = html.escape(r.display_symbol)
-            signal   = html.escape(str(r.signal_type))
-
-            def pct_d(t, e):
-                if e <= 0: return ""
-                return f"{(t-e)/e*100:+.2f}%"
+            symbol = html.escape(r.display_symbol)
 
             lines.append(
                 f"{badge} <b>{rank_name}</b>\n"
                 f"<b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
                 f"🔻 <b>KHUYẾN NGHỊ SHORT</b>\n"
-                f"💰 Giá: <b>{r.price_current:.6g}</b> | {r.price_chg:.2f}%"
+                f"💰 Giá: <b>{fmt_price(r.price_current)}</b> | {r.price_chg:.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
-                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct_d(r.tp1, r.entry)})\n"
-                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct_d(r.tp2, r.entry)})\n"
-                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct_d(r.tp3, r.entry)})"
+                    f"{entry_block(r, 'SHORT')}\n"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
-    else:
-        lines.append("<i>Không tìm thấy coin dump đủ điều kiện.</i>\n")
 
-    # ── REVERSAL SECTION ──────────────────────────────────────────
-    lines.append("═══════════════════════════")
-    lines.append("🔄 <b>TOP REVERSAL — ĐẢO CHIỀU NGẮN HẠN</b>")
-    lines.append("═══════════════════════════\n")
-
+    # ── REVERSAL SECTION: chỉ hiện khi có kết quả ───────────────
     if rev_results:
+        lines.append("═══════════════════════════")
+        lines.append("🔄 <b>TOP REVERSAL — ĐẢO CHIỀU NGẮN HẠN</b>")
+        lines.append("═══════════════════════════\n")
+
         for r in rev_results[:4]:
             symbol = html.escape(r.display_symbol)
             is_long = r.reversal_type in ("DUMP_REVERSAL", "H1_BREAKOUT_LONG")
+            side = "LONG" if is_long else "SHORT"
             side_line = "🟢 <b>KHUYẾN NGHỊ LONG</b>" if is_long else "🔻 <b>KHUYẾN NGHỊ SHORT</b>"
-
-            def pct_rev(t, e):
-                if e <= 0: return ""
-                return f"{(t-e)/e*100:+.2f}%"
 
             lines.append(
                 f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
                 f"{side_line}\n"
-                f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}%"
+                f"💰 Giá: <b>{fmt_price(r.price_current)}</b> | 1H: {r.h1_chg:+.2f}%"
             )
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
-                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct_rev(r.tp1, r.entry)})\n"
-                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct_rev(r.tp2, r.entry)})\n"
-                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct_rev(r.tp3, r.entry)})"
+                    f"{entry_block(r, side)}\n"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
-    else:
-        lines.append("<i>Không có reversal đủ điều kiện.</i>\n")
+
+    if not pump_results and not dump_results and not rev_results:
+        lines.append("<i>Không có signal đủ điều kiện.</i>\n")
 
     lines.append("⚠️ <i>Không phải lời khuyên đầu tư. Luôn đặt SL.</i>")
     return "\n".join(lines)
-
 
 def save_results(pump_results: list[ScoreResult], dump_results: list[ScoreResult],
                  rev_results: list[ScoreResult]) -> str:
