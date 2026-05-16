@@ -65,6 +65,12 @@ DUMP_REV_1H_VOL_MULT = 1.5            # Vol 1H ≥ 1.5x MA10_1H
 INTRADAY_DUMP_MIN = 15.0              # Intraday dump (open→low) ≥ 15% trong nến ngày hiện tại
 MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt reversal list
 
+# REVERSAL output rule: chỉ lấy 1 LONG + 1 SHORT điểm cao nhất.
+# Ưu tiên Binance/Bybit khi điểm gần nhau để tránh lệch giá/spread ở sàn nhỏ.
+REVERSAL_TOP_PER_SIDE = 1
+REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2, "BingX": 1}
+REVERSAL_PRIORITY_SCORE_BONUS = 0.25
+
 # ── H2 Scan config ────────────────────────────────────────────
 H2_MIN_CHG      = 7.0    # H2 tăng/giảm tối thiểu 7%
 H2_MIN_VOL      = 1.3    # vol_ratio H2 tối thiểu (thấp hơn D vì H2 vol hay thấp)
@@ -2670,7 +2676,7 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
 
     Quy tắc PUMP: SQUEEZE ưu tiên TOP 1, còn lại theo total_score.
     Quy tắc DUMP: top 2 theo total_score.
-    Quy tắc REVERSAL: top 1 mỗi loại (PUMP_REV + DUMP_REV).
+    Quy tắc REVERSAL: chỉ lấy 1 LONG + 1 SHORT, ưu tiên Binance/Bybit.
     """
     TOP_PUMP = 1
     TOP_DUMP = 1
@@ -2749,17 +2755,11 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     unique_dump.sort(key=lambda x: x.total_score, reverse=True)
     final_dump = unique_dump[:TOP_DUMP]
 
-    # ── REVERSAL: top 1 mỗi loại ──────────────────────────────────
-    # ── REVERSAL: top 1 mỗi loại signal ─────────────────────────
-    def top1_by_type(rtype: str) -> Optional[ScoreResult]:
-        filtered = [r for r in unique_rev if r.reversal_type == rtype]
-        return max(filtered, key=lambda x: x.total_score) if filtered else None
-
-    final_rev: list[ScoreResult] = []
-    for rtype in ("PUMP_REVERSAL", "DUMP_REVERSAL", "H1_BREAKOUT_LONG", "H1_BREAKOUT_SHORT"):
-        r = top1_by_type(rtype)
-        if r:
-            final_rev.append(r)
+    # ── REVERSAL: chỉ lấy TOP 1 LONG + TOP 1 SHORT ────────────────
+    # LONG = DUMP_REVERSAL hoặc H1_BREAKOUT_LONG
+    # SHORT = PUMP_REVERSAL hoặc H1_BREAKOUT_SHORT
+    # Ưu tiên Binance/Bybit bằng bonus nhỏ trong ranking.
+    final_rev = select_top_reversal_long_short(unique_rev)
 
     return final_pump, final_dump, final_rev
 
@@ -2791,7 +2791,7 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
                  rev_results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"🚀📉 <b>PUMP &amp; DUMP SCANNER V6</b>",
+        f"🚀📉 <b>PUMP &amp; DUMP SCANNER V7</b>",
         f"🕒 <b>{now}</b>",
         f"📊 Quét: {' | '.join(SCAN_EXCHANGES)} — 1D + 1H\n",
     ]
@@ -2884,6 +2884,37 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
     else:
         lines.append("<i>Không tìm thấy coin dump đủ điều kiện.</i>\n")
 
+    # ── REVERSAL SECTION ──────────────────────────────────────────
+    lines.append("═══════════════════════════")
+    lines.append("🔄 <b>TOP REVERSAL — ĐẢO CHIỀU NGẮN HẠN</b>")
+    lines.append("═══════════════════════════\n")
+
+    if rev_results:
+        for r in rev_results[:4]:
+            symbol = html.escape(r.display_symbol)
+            is_long = r.reversal_type in ("DUMP_REVERSAL", "H1_BREAKOUT_LONG")
+            side_line = "🟢 <b>KHUYẾN NGHỊ LONG</b>" if is_long else "🔻 <b>KHUYẾN NGHỊ SHORT</b>"
+
+            def pct_rev(t, e):
+                if e <= 0: return ""
+                return f"{(t-e)/e*100:+.2f}%"
+
+            lines.append(
+                f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
+                f"{side_line}\n"
+                f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}%"
+            )
+            if r.entry > 0 and r.tp1 > 0:
+                lines.append(
+                    f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                    f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct_rev(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct_rev(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct_rev(r.tp3, r.entry)})"
+                )
+            lines.append("")
+    else:
+        lines.append("<i>Không có reversal đủ điều kiện.</i>\n")
+
     lines.append("⚠️ <i>Không phải lời khuyên đầu tư. Luôn đặt SL.</i>")
     return "\n".join(lines)
 
@@ -2955,7 +2986,7 @@ def save_results(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 def run_reversal_scan() -> list[ScoreResult]:
     """
     Chỉ scan Reversal (1H) — dùng cho job 30 phút.
-    3 sàn chạy SONG SONG, dedup, trả về top 1 mỗi loại.
+    3 sàn chạy SONG SONG, dedup, trả về top 1 LONG + top 1 SHORT.
     """
     all_rev: list[ScoreResult] = []
     scan_start = time.time()
@@ -3007,12 +3038,48 @@ def run_reversal_scan() -> list[ScoreResult]:
             seen[base] = r
     unique = list(seen.values())
 
-    result: list[ScoreResult] = []
-    for rtype in ("PUMP_REVERSAL", "DUMP_REVERSAL", "H1_BREAKOUT_LONG", "H1_BREAKOUT_SHORT"):
-        filtered = [r for r in unique if r.reversal_type == rtype]
-        if filtered:
-            result.append(max(filtered, key=lambda x: x.total_score))
-    return result
+    # Chỉ gửi 1 LONG + 1 SHORT điểm cao nhất, ưu tiên Binance/Bybit.
+    return select_top_reversal_long_short(unique)
+
+
+def _reversal_side(r: ScoreResult) -> str:
+    """Map reversal signal về LONG/SHORT để lọc top theo từng phía."""
+    if r.reversal_type in ("DUMP_REVERSAL", "H1_BREAKOUT_LONG"):
+        return "LONG"
+    if r.reversal_type in ("PUMP_REVERSAL", "H1_BREAKOUT_SHORT", "DISTRIBUTION_SHORT"):
+        return "SHORT"
+    # fallback theo signal_type nếu có custom signal mới
+    sig = (r.signal_type or "").upper()
+    if "LONG" in sig:
+        return "LONG"
+    if "SHORT" in sig or "DUMP" in sig:
+        return "SHORT"
+    return ""
+
+
+def _reversal_rank_key(r: ScoreResult) -> tuple[float, int, float]:
+    """Rank REVERSAL: điểm chính + ưu tiên Binance/Bybit + volume ratio."""
+    ex_bonus = REVERSAL_PRIORITY_EXCHANGES.get(r.exchange, 0)
+    effective_score = r.total_score + (REVERSAL_PRIORITY_SCORE_BONUS if ex_bonus >= 2 else 0)
+    return (effective_score, ex_bonus, r.vol_ratio)
+
+
+def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResult]:
+    """
+    Trả về tối đa 2 signal REVERSAL:
+    - 1 LONG điểm cao nhất
+    - 1 SHORT điểm cao nhất
+    Ưu tiên Binance/Bybit khi điểm gần nhau nhờ priority bonus nhỏ.
+    """
+    selected: list[ScoreResult] = []
+    for side in ("LONG", "SHORT"):
+        side_items = [r for r in results if _reversal_side(r) == side]
+        if not side_items:
+            continue
+        top = max(side_items, key=_reversal_rank_key)
+        selected.append(top)
+    selected.sort(key=_reversal_rank_key, reverse=True)
+    return selected
 
 
 def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
@@ -3028,62 +3095,37 @@ def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
 
 
 def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
-    """Alert gọn cho scan 30 phút — Reversal signals với M30 xác nhận + TP/SL."""
+    """Alert REVERSAL ngắn gọn: coin, LONG/SHORT, entry, SL, TP."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"🔄 <b>REVERSAL UPDATE — {now}</b>",
-        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H + M30\n",
+        f"🔄 <b>REVERSAL ALERT — {now}</b>",
+        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H + M30 | Top 1 LONG + Top 1 SHORT\n",
     ]
 
+    if not rev_results:
+        lines.append("<i>Không có reversal đủ điều kiện.</i>")
+        return "\n".join(lines)
+
     for r in rev_results:
-        symbol   = html.escape(r.display_symbol)
-        signal   = html.escape(str(r.signal_type))
-
-        if r.reversal_type == "PUMP_REVERSAL":
-            rev_icon  = "🔴🔄"
-            rev_label = "PUMP → SHORT"
-            chg_line  = f"1D: +{r.price_chg:.2f}% | 1H: {r.h1_chg:.2f}%"
-        elif r.reversal_type == "DUMP_REVERSAL":
-            rev_icon  = "🟢🔄"
-            rev_label = "DUMP → LONG"
-            chg_line  = f"1D: {r.price_chg:.2f}% | 1H: +{r.h1_chg:.2f}%"
-        elif r.reversal_type == "H1_BREAKOUT_LONG":
-            rev_icon  = "🟢⚡"
-            rev_label = "H1 BREAKOUT — LONG"
-            chg_line  = f"1H: +{r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
-        else:  # H1_BREAKOUT_SHORT
-            rev_icon  = "🔴⚡"
-            rev_label = "H1 BREAKOUT — SHORT"
-            chg_line  = f"1H: {r.h1_chg:.2f}% | 1D: {r.price_chg:+.2f}%"
-
-        # M30 status tag
-        if r.m30_confirmed:
-            m30_tag = f"✅ M30: {r.m30_chg:+.2f}% (xác nhận)"
-        elif r.m30_chg != 0:
-            m30_tag = f"⚠️ M30: {r.m30_chg:+.2f}% (chưa xác nhận)"
-        else:
-            m30_tag = "M30: N/A"
-
-        # H1 time remaining tag
-        if r.h1_minutes_left > 0:
-            h1_tag = f"⏱️ H1 còn ~{r.h1_minutes_left}phút"
-        else:
-            h1_tag = "⏱️ H1 vừa đóng"
+        symbol = html.escape(r.display_symbol)
+        is_long = r.reversal_type in ("DUMP_REVERSAL", "H1_BREAKOUT_LONG")
+        side_line = "🟢 <b>KHUYẾN NGHỊ LONG</b>" if is_long else "🔻 <b>KHUYẾN NGHỊ SHORT</b>"
 
         def pct(target: float, entry: float) -> str:
-            if entry <= 0: return ""
+            if entry <= 0:
+                return ""
             return f"{(target - entry) / entry * 100:+.2f}%"
 
-        lines.append(f"{rev_icon} <b>{rev_label} — {symbol}</b> — <b>{r.total_score:.1f}đ</b>")
-        lines.append(f"⚡ <b>{signal}</b>")
-        lines.append(f"💰 {chg_line}")
-        lines.append(f"{m30_tag} | {h1_tag} | FR: {r.fr:.4f}%")
-
+        lines.append(
+            f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"{side_line}\n"
+            f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}% | M30: {r.m30_chg:+.2f}%"
+        )
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
                 f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
-                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
                 f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
             )
         lines.append("")
@@ -3980,111 +4022,61 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── SCHEDULER: 2 loại scan mỗi 30 phút ──────────────────
-        #
-        #   xx:02 UTC → Full scan (PUMP + DUMP + REVERSAL) → gửi đầy đủ
-        #   xx:32 UTC → Reversal-only scan → gửi nếu có signal, im lặng nếu không
-        #
-        #   Nếu ENABLE_30MIN_SCAN = False → chỉ chạy xx:02 như cũ
-        #
-        #   Anti-overlap: nếu scan kéo dài qua mốc kế tiếp → bỏ mốc đó,
-        #   chờ mốc tiếp theo để tránh chạy chồng.
-
+        # ── SCHEDULER V7: quét MỖI GIỜ lúc xx:02 UTC ─────────────
+        # Mỗi lần chạy: PUMP + DUMP + REVERSAL, alert gọn gồm:
+        # coin, khuyến nghị LONG/SHORT, Entry, SL, TP1/TP2/TP3.
         from datetime import timedelta
 
         FULL_SCAN_MINUTE = 2
-        REV_SCAN_MINUTE  = 32
-        CHECK_SLEEP      = 30
-        HOLD_CHECK_HOURS = {6, 12, 18}      # Hold/Out check mỗi 6H
-        H2_SCAN_HOURS_SET = set(range(2, 24, 2))  # 02,04,06...22 UTC — H2 scan mỗi 2H
+        CHECK_SLEEP = 30
 
-        def next_slot_utc(now=None):
+        def next_hourly_slot_utc(now=None):
             now = now or datetime.now(timezone.utc)
-            base = now.replace(second=0, microsecond=0)
-            candidates = []
+            target = now.replace(minute=FULL_SCAN_MINUTE, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(hours=1)
+            return target
 
-            # daily 00:02 UTC
-            s = base.replace(hour=0, minute=FULL_SCAN_MINUTE)
-            if s <= now: s += timedelta(days=1)
-            candidates.append((s, "daily"))
+        def slot_id(dt):
+            return dt.strftime("%Y%m%d%H%M")
 
-            # hold check 06:02, 12:02, 18:02 UTC
-            for h in HOLD_CHECK_HOURS:
-                s = base.replace(hour=h, minute=FULL_SCAN_MINUTE)
-                if s <= now: s += timedelta(days=1)
-                candidates.append((s, "hold_check"))
-
-            # H2 scan 02:02, 04:02, 06:02... 22:02 UTC
-            for h in H2_SCAN_HOURS_SET:
-                s = base.replace(hour=h, minute=FULL_SCAN_MINUTE)
-                if s <= now: s += timedelta(days=1)
-                candidates.append((s, "h2_scan"))
-
-            # full scan: xx:02 các giờ lẻ không trùng daily/hold/h2
-            occupied = {0} | HOLD_CHECK_HOURS | H2_SCAN_HOURS_SET
-            s = base.replace(minute=FULL_SCAN_MINUTE)
-            if s <= now: s += timedelta(hours=1)
-            while s.hour in occupied:
-                s += timedelta(hours=1)
-            candidates.append((s, "full"))
-
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0]
-
-        def slot_id(dt, kind):
-            return f"{dt.strftime('%Y%m%d%H%M')}_{kind}"
-
-        log.info("⏰ SCHEDULER V5 khởi động")
-        log.info("   00:02 UTC           → DAILY MTF scan (D+H12+H6 — 1 lần/ngày)")
-        log.info("   02/04/06...22:02    → H2 scan (pump/dump H2 — mỗi 2H)")
-        log.info("   06/12/18:02 UTC     → HOLD/OUT check (H6 — mỗi 6H)")
-        log.info("   xx:02 giờ lẻ        → Full scan 1D (mỗi giờ còn lại)")
+        log.info("⏰ SCHEDULER V7 khởi động")
+        log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
+        log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
         last_executed_slot = ""
 
         while True:
-            target, slot_kind = next_slot_utc()
+            target = next_hourly_slot_utc()
 
             while True:
                 now = datetime.now(timezone.utc)
                 wait = (target - now).total_seconds()
-                if wait <= 0: break
-                labels = {"daily":"Daily MTF","hold_check":"Hold/Out","full":"Full scan","reversal":"Reversal"}
-                log.info(f"⏳ Đợi {wait/60:.1f}p đến {target.strftime('%H:%M UTC')} ({labels.get(slot_kind,slot_kind)})...")
+                if wait <= 0:
+                    break
+                log.info(f"⏳ Đợi {wait/60:.1f}p đến {target.strftime('%H:%M UTC')} (Full scan hourly)...")
                 time.sleep(min(wait, CHECK_SLEEP))
 
-            current_slot = slot_id(target, slot_kind)
+            current_slot = slot_id(target)
             if current_slot == last_executed_slot:
                 log.warning(f"⚠️ Slot {current_slot} đã chạy — bỏ qua")
-                time.sleep(60); continue
+                time.sleep(60)
+                continue
 
             scan_start_dt = datetime.now(timezone.utc)
-            scan_start    = time.time()
+            scan_start = time.time()
             last_executed_slot = current_slot
 
             try:
-                if slot_kind == "daily":
-                    log.info(f"📅 [{scan_start_dt.strftime('%H:%M UTC')}] Daily MTF scan...")
-                    job_daily_mtf()
-                elif slot_kind == "hold_check":
-                    log.info(f"🔍 [{scan_start_dt.strftime('%H:%M UTC')}] Hold/Out check...")
-                    job_hold_check()
-                elif slot_kind == "h2_scan":
-                    log.info(f"⚡ [{scan_start_dt.strftime('%H:%M UTC')}] H2 scan...")
-                    job_h2_scan()
-                elif slot_kind == "full":
-                    log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan 1D...")
-                    job()
-                else:
-                    pass  # Reversal scan đã tắt
+                log.info(f"🚀 [{scan_start_dt.strftime('%H:%M UTC')}] Full scan hourly...")
+                job()
             except Exception as e:
-                log.error(f"Scheduler [{slot_kind}]: {e}", exc_info=True)
-                try: send_telegram(f"❌ [{slot_kind}] error: {html.escape(str(e))}")
-                except Exception: pass
+                log.error(f"Scheduler hourly error: {e}", exc_info=True)
+                try:
+                    send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
+                except Exception:
+                    pass
 
-            elapsed     = time.time() - scan_start
-            finished_dt = datetime.now(timezone.utc)
-            next_target, next_kind = next_slot_utc(finished_dt)
-            labels = {"daily":"Daily MTF","hold_check":"Hold/Out",
-                      "h2_scan":"H2 Scan","full":"Full 1D"}
-            log.info(f"✅ Xong {elapsed:.0f}s — tiếp theo: {next_target.strftime('%H:%M UTC')} ({labels.get(next_kind,next_kind)})")
+            elapsed = time.time() - scan_start
+            next_target = next_hourly_slot_utc(datetime.now(timezone.utc))
+            log.info(f"✅ Xong {elapsed:.0f}s — tiếp theo: {next_target.strftime('%H:%M UTC')} (Full scan hourly)")
