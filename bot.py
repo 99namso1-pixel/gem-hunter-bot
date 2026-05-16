@@ -67,7 +67,7 @@ MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt revers
 
 # REVERSAL output rule: chỉ lấy 1 LONG + 1 SHORT điểm cao nhất.
 # Ưu tiên Binance/Bybit khi điểm gần nhau để tránh lệch giá/spread ở sàn nhỏ.
-REVERSAL_TOP_PER_SIDE = 1
+REVERSAL_TOP_PER_SIDE = 2              # 2 LONG + 2 SHORT = 4 signals mỗi lần scan
 REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2}
 REVERSAL_PRIORITY_SCORE_BONUS = 0.25
 
@@ -100,12 +100,13 @@ HYBRID_MIN_SCORE = 5.0                  # Cả trend + squeeze đều mạnh
 
 # Tăng tốc scan
 FAST_SCAN = True
-MAX_WORKERS_BINANCE = 12   # Giữ — Binance weight-based, 12 là sweet spot
+MAX_WORKERS_BINANCE = 8    # Giảm 12→8: tránh 429 Binance weight limit
 MAX_WORKERS_BYBIT   = 6    # Giảm 15→6: tránh 403 rate limit Bybit
 MAX_WORKERS_BINGX   = 6    # BingX limit 10 req/s thực tế
 MAX_WORKERS_KUCOIN  = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
 BYBIT_REQUEST_DELAY  = 0.12  # 120ms delay giữa Bybit requests → ~8 req/s, tránh 403
+BINANCE_REQUEST_DELAY = 0.05 # 50ms delay giữa Binance requests → tránh 429 burst
 
 # Số workers tối đa cho parallel exchange scan
 MAX_WORKERS_EXCHANGES = 2  # Chạy Binance + Bybit song song
@@ -133,10 +134,15 @@ KUCOIN_BASE = "https://api-futures.kucoin.com"   # KuCoin Futures public API
 import threading as _threading
 _kucoin_lock = _threading.Semaphore(MAX_WORKERS_KUCOIN)
 
-# Rate limiter cho Bybit — tránh 403 khi scan nhiều coin song song
+# Rate limiter cho Bybit — tránh 403
 _bybit_lock  = _threading.Semaphore(MAX_WORKERS_BYBIT)
 _bybit_last_request = 0.0
 _bybit_lock_mu = _threading.Lock()
+
+# Rate limiter cho Binance — tránh 429 weight limit
+_binance_lock = _threading.Semaphore(MAX_WORKERS_BINANCE)
+_binance_last_req = 0.0
+_binance_lock_mu  = _threading.Lock()
 
 CG_HEADERS = {
     "accept": "application/json",
@@ -272,14 +278,38 @@ class ScoreResult:
 # ══════════════════════════════════════════════════════════════
 
 def http_get(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 15) -> Optional[Any]:
+    """Generic HTTP GET với 429 backoff tự động."""
+    global _binance_last_req
+    is_binance = "fapi.binance.com" in url
+
     for attempt in range(3):
         try:
+            # Binance rate limiting
+            if is_binance:
+                with _binance_lock_mu:
+                    elapsed = time.time() - _binance_last_req
+                    if elapsed < BINANCE_REQUEST_DELAY:
+                        time.sleep(BINANCE_REQUEST_DELAY - elapsed)
+                    _binance_last_req = time.time()
+
             r = get_session().get(url, params=params or {}, headers=headers or {}, timeout=timeout)
+
+            if r.status_code == 429:
+                # Binance trả về Retry-After header khi 429
+                retry_after = float(r.headers.get("Retry-After", 5 * (attempt + 1)))
+                wait = min(retry_after, 30.0)
+                log.warning(f"429 Too Many Requests: {url.split('?')[0]} — wait {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
             r.raise_for_status()
             return r.json()
+
         except requests.RequestException as e:
-            log.warning(f"GET failed ({attempt+1}/3): {url} — {e}")
-            time.sleep(2 ** attempt)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            else:
+                log.debug(f"GET failed ({attempt+1}/3): {url.split('?')[0]} — {e}")
     return None
 
 
@@ -2949,46 +2979,42 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
 
     def entry_block(r: ScoreResult, side: str) -> str:
         """
-        Tách Entry Now / Entry Limit.
-        - DUMP signal với Fib: chỉ hiện Entry Limit (chờ bounce), bỏ Entry Now
-        - PUMP / DUMP nhỏ: hiện Entry Now + Entry Limit
+        Hiển thị entry:
+        - Fib bounce (DUMP dump sâu): chỉ Entry Limit, không Entry Now
+        - Entry Now = Entry Limit (reversal/pump): chỉ hiện 1 dòng "Entry Now"
+        - Entry Now ≠ Entry Limit (giá đã chạy xa): hiện cả 2
         """
         current     = r.price_current or 0
         limit_entry = r.entry or current
 
-        # DUMP với Fib entry — chỉ hiện Entry Limit, không có Entry Now
+        # DUMP với Fib — chỉ Entry Limit
         fib_limit = getattr(r, "entry_limit", 0)
         use_fib   = (side == "SHORT" and fib_limit > 0 and fib_limit != limit_entry)
-
         if use_fib:
             drop_pct = abs(r.price_chg) if r.price_chg else 0
-            if drop_pct >= 15:
-                fib_label = "Fib 38.2%"
-            elif drop_pct >= 8:
-                fib_label = "Fib 50%"
-            else:
-                fib_label = "Entry Limit"
-
+            fib_label = "Fib 38.2%" if drop_pct >= 15 else ("Fib 50%" if drop_pct >= 8 else "Entry Limit")
             rr_display = ""
             if fib_limit > 0 and r.sl > 0 and r.tp1 > 0:
-                risk   = abs(r.sl - fib_limit)
-                reward = abs(fib_limit - r.tp1)
+                risk = abs(r.sl - fib_limit)
                 if risk > 0:
-                    rr = reward / risk
-                    rr_display = f" | R:R <b>1:{rr:.1f}</b>"
-
-            # Không có Entry Now — chỉ hiện limit entry
+                    rr_display = f" | R:R <b>1:{abs(fib_limit - r.tp1)/risk:.1f}</b>"
             return (
                 f"📍 Entry Limit ({fib_label}): <b>{fmt_price(fib_limit)}</b> | "
                 f"SL: <b>{fmt_price(r.sl)}</b>{rr_display}"
             )
 
-        # PUMP hoặc DUMP nhỏ — logic cũ: Entry Now + Entry Limit
+        # Entry Now ≈ Entry Limit → chỉ hiện 1 dòng gọn
         dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
-        now_line = f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
-        if dist_pct > 3.0:
-            now_line = f"⚡ Entry Now: <b>Không chase</b>"
+        if dist_pct <= 1.0:
+            # Giống nhau hoặc rất gần — chỉ hiện Entry Now
+            return f"⚡ Entry Now: <b>{fmt_price(current)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
 
+        # Giá đã chạy xa Entry Limit → hiện cả 2
+        now_line = (
+            f"⚡ Entry Now: <b>Không chase</b>"
+            if dist_pct > 3.0
+            else f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
+        )
         return (
             f"{now_line}\n"
             f"📍 Entry Limit: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
@@ -3241,20 +3267,24 @@ def _reversal_rank_key(r: ScoreResult) -> tuple[float, int, float]:
 
 def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResult]:
     """
-    Trả về tối đa 2 signal REVERSAL:
-    - 1 LONG điểm cao nhất
-    - 1 SHORT điểm cao nhất
-    Ưu tiên Binance/Bybit khi điểm gần nhau nhờ priority bonus nhỏ.
+    Trả về tối đa REVERSAL_TOP_PER_SIDE × 2 signals:
+    - Top N LONG điểm cao nhất
+    - Top N SHORT điểm cao nhất
+    Ưu tiên Binance/Bybit khi điểm gần nhau nhờ priority bonus.
+    Mặc định: 2 LONG + 2 SHORT = 4 signals.
     """
     selected: list[ScoreResult] = []
     for side in ("LONG", "SHORT"):
         side_items = [r for r in results if _reversal_side(r) == side]
         if not side_items:
             continue
-        top = max(side_items, key=_reversal_rank_key)
-        selected.append(top)
-    selected.sort(key=_reversal_rank_key, reverse=True)
-    return selected
+        # Sắp xếp và lấy top N
+        top_n = sorted(side_items, key=_reversal_rank_key, reverse=True)[:REVERSAL_TOP_PER_SIDE]
+        selected.extend(top_n)
+    # Sắp xếp lại: LONG trước SHORT, trong cùng side sắp theo điểm
+    longs  = [r for r in selected if _reversal_side(r) == "LONG"]
+    shorts = [r for r in selected if _reversal_side(r) == "SHORT"]
+    return longs + shorts
 
 
 def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
@@ -3270,52 +3300,68 @@ def _reversal_only(exchange: str, symbol: str) -> Optional[ScoreResult]:
 
 
 def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
-    """Alert REVERSAL ngắn gọn: coin, LONG/SHORT, entry, SL, TP."""
+    """Alert REVERSAL: 2 LONG + 2 SHORT cho lướt ngắn."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"🔄 <b>REVERSAL ALERT — {now}</b>",
-        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H + M30 | Top 1 LONG + Top 1 SHORT\n",
+        f"📊 {' | '.join(SCAN_EXCHANGES)} — 1H + M30 | Top 2 LONG + Top 2 SHORT\n",
     ]
 
     if not rev_results:
         lines.append("<i>Không có reversal đủ điều kiện.</i>")
         return "\n".join(lines)
 
-    for r in rev_results:
-        symbol = html.escape(r.display_symbol)
-        is_long = r.reversal_type in ("DUMP_REVERSAL", "H1_BREAKOUT_LONG")
+    longs  = [r for r in rev_results if _reversal_side(r) == "LONG"]
+    shorts = [r for r in rev_results if _reversal_side(r) == "SHORT"]
+
+    long_rank_labels  = ["🟢🥇", "🟢🥈"]
+    short_rank_labels = ["🔴🥇", "🔴🥈"]
+
+    def pct(target: float, entry: float) -> str:
+        if entry <= 0: return ""
+        return f"{(target - entry) / entry * 100:+.2f}%"
+
+    def fmt_price(v: float) -> str:
+        return f"{v:.6g}" if v and v > 0 else "-"
+
+    def render_reversal(r: ScoreResult, badge: str) -> None:
+        symbol  = html.escape(r.display_symbol)
+        is_long = _reversal_side(r) == "LONG"
         side_line = "🟢 <b>KHUYẾN NGHỊ LONG</b>" if is_long else "🔻 <b>KHUYẾN NGHỊ SHORT</b>"
-
-        def pct(target: float, entry: float) -> str:
-            if entry <= 0:
-                return ""
-            return f"{(target - entry) / entry * 100:+.2f}%"
-
-        # 7D context line
-        change_7d_val = getattr(r, '_change_7d_display', 0)
-        # Lấy từ details nếu có
         cap_note = ""
         for d in (r.details or []):
             if "Score giới hạn" in d:
-                cap_note = f" ⚠️ capped"
-                break
-            if "7D uptrend" in d:
-                cap_note = f" ✅ macro up"
+                cap_note = " ⚠️ capped"
                 break
 
         lines.append(
-            f"🔄 <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{cap_note}\n"
+            f"{badge} <b>{symbol}</b> — <b>{r.total_score:.1f}đ</b>{cap_note}\n"
             f"{side_line}\n"
-            f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}% | M30: {r.m30_chg:+.2f}%"
+            f"💰 Giá: <b>{fmt_price(r.price_current)}</b> | 1H: {r.h1_chg:+.2f}% | M30: {r.m30_chg:+.2f}%"
         )
         if r.entry > 0 and r.tp1 > 0:
+            entry_ref = r.entry
             lines.append(
-                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
-                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
-                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                f"⚡ Entry Now: <b>{fmt_price(r.price_current)}</b> | SL: <b>{fmt_price(r.sl)}</b>\n"
+                f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, entry_ref)})\n"
+                f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, entry_ref)})\n"
+                f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, entry_ref)})"
             )
         lines.append("")
+
+    # LONG section
+    if longs:
+        lines.append("─── 🟢 TOP LONG ───")
+        for i, r in enumerate(longs):
+            badge = long_rank_labels[i] if i < len(long_rank_labels) else "🟢"
+            render_reversal(r, badge)
+
+    # SHORT section
+    if shorts:
+        lines.append("─── 🔴 TOP SHORT ───")
+        for i, r in enumerate(shorts):
+            badge = short_rank_labels[i] if i < len(short_rank_labels) else "🔴"
+            render_reversal(r, badge)
 
     lines.append("⚠️ <i>Không phải lời khuyên đầu tư. Luôn đặt SL.</i>")
     return "\n".join(lines)
@@ -4464,32 +4510,34 @@ if __name__ == "__main__":
         # Fix: KHÔNG dùng next_hourly_slot_utc() trong loop vì dễ miss xx:02 nếu bot thức dậy sau vài giây.
         # Logic mới check theo phút hiện tại, chạy đúng 1 lần mỗi slot.
 
-        FULL_SCAN_MINUTE = 2
-        MONITOR_MINUTES = (17, 47)
+        FULL_SCAN_MINUTE    = 2       # xx:02 UTC → Full scan: PUMP + DUMP + REVERSAL
+        REVERSAL_MINUTE     = 32      # xx:32 UTC → Reversal only (update mỗi giờ)
+        MONITOR_MINUTES     = (17, 47)
         CHECK_SLEEP = 10
 
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
-        log.info("⏰ SCHEDULER V7.2 FIXED khởi động")
+        log.info("⏰ SCHEDULER V7.3 khởi động")
         log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
-        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold, alert THOÁT nếu deteriorate")
+        log.info("   xx:32 UTC → Reversal only scan (update giữa giờ)")
+        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
-        last_full_slot = ""
-        last_monitor_slot = ""
+        last_full_slot     = ""
+        last_reversal_slot = ""
+        last_monitor_slot  = ""
 
         while True:
             now = datetime.now(timezone.utc)
             current_slot = slot_id(now)
 
-            # Full scan hourly — chạy 1 lần trong phút xx:02 UTC
+            # Full scan hourly — xx:02 UTC
             if now.minute == FULL_SCAN_MINUTE and current_slot != last_full_slot:
                 last_full_slot = current_slot
-                scan_start_dt = datetime.now(timezone.utc)
                 scan_start = time.time()
                 try:
-                    log.info(f"🚀 [{scan_start_dt.strftime('%H:%M:%S UTC')}] Full scan hourly...")
+                    log.info(f"🚀 [{now.strftime('%H:%M:%S UTC')}] Full scan hourly...")
                     job()
                 except Exception as e:
                     log.error(f"Scheduler hourly error: {e}", exc_info=True)
@@ -4497,10 +4545,22 @@ if __name__ == "__main__":
                         send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
                     except Exception:
                         pass
-                elapsed = time.time() - scan_start
-                log.info(f"✅ Full scan xong {elapsed:.0f}s")
+                log.info(f"✅ Full scan xong {time.time()-scan_start:.0f}s")
 
-            # Monitor active trades — chạy 1 lần trong phút xx:17 và xx:47 UTC
+            # Reversal only scan — xx:32 UTC (giữa giờ)
+            if ENABLE_1H_REVERSAL and now.minute == REVERSAL_MINUTE and current_slot != last_reversal_slot:
+                last_reversal_slot = current_slot
+                try:
+                    log.info(f"🔄 [{now.strftime('%H:%M:%S UTC')}] Reversal scan (mid-hour)...")
+                    job_reversal_only()
+                except Exception as e:
+                    log.error(f"Reversal scheduler error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ [reversal] error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+
+            # Monitor active trades — xx:17 và xx:47 UTC
             if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
                 last_monitor_slot = current_slot
                 try:
@@ -4513,12 +4573,14 @@ if __name__ == "__main__":
                     except Exception:
                         pass
 
-            # Log nhẹ để biết bot còn sống, không spam mỗi 10s quá nhiều
+            # Alive log
             if now.second < CHECK_SLEEP:
                 next_full_h = now.hour if now.minute < FULL_SCAN_MINUTE else (now.hour + 1) % 24
                 log.info(
-                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Full: {next_full_h:02d}:{FULL_SCAN_MINUTE:02d} UTC | "
-                    f"Monitor: xx:17 / xx:47"
+                    f"⏳ {now.strftime('%H:%M:%S UTC')} | "
+                    f"Full: {next_full_h:02d}:{FULL_SCAN_MINUTE:02d} | "
+                    f"Rev: xx:{REVERSAL_MINUTE:02d} | "
+                    f"Monitor: xx:17/xx:47"
                 )
 
             time.sleep(CHECK_SLEEP)
