@@ -303,6 +303,11 @@ class ScoreResult:
     tp3: float = 0
     rr_tp1: float = 0           # Risk:Reward tới TP1
     rr_tp2: float = 0           # Risk:Reward tới TP2
+    # Entry plan cho TOP PUMP/DUMP: hạn chế FOMO, ưu tiên limit ở vùng hồi/retest
+    entry_now_allowed: bool = False
+    entry_zone_low: float = 0
+    entry_zone_high: float = 0
+    entry_note: str = ""
     details: list = field(default_factory=list)
 
     @property
@@ -1264,30 +1269,74 @@ def classify_market_mode(result: ScoreResult, coin: CoinData, vol_ratio: float) 
         result.total_score += 0.4
 
 def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
-    """Tính Entry/SL/TP cho pump/dump từ range nến D."""
+    """Tính Entry/SL/TP cho TOP PUMP/DUMP theo kiểu futures thực chiến.
+
+    Bản cũ dùng close hiện tại làm entry nên dễ chase đúng đỉnh/đáy.
+    Bản này tách:
+    - Entry Now: chỉ cho phép nếu giá đang nằm gần vùng limit.
+    - Entry Limit: vùng hồi/retest 0.382–0.618 của range ngày.
+    """
     import math
     d_range = coin.high - coin.low
     if d_range <= 0 or coin.close <= 0:
         return
 
     def fmt(v: float) -> float:
-        if v <= 0: return 0.0
+        if v <= 0:
+            return 0.0
         digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
         return round(v, digits)
 
-    entry = coin.close
-    result.entry = fmt(entry)
+    current = coin.close
 
-    if coin.close >= coin.open:  # PUMP
-        result.sl  = fmt(coin.low  - d_range * 0.1)
-        result.tp1 = fmt(entry + d_range * 0.5)
-        result.tp2 = fmt(entry + d_range * 1.0)
-        result.tp3 = fmt(entry + d_range * 1.618)
-    else:  # DUMP
-        result.sl  = fmt(coin.high + d_range * 0.1)
-        result.tp1 = fmt(entry - d_range * 0.5)
-        result.tp2 = fmt(entry - d_range * 1.0)
-        result.tp3 = fmt(entry - d_range * 1.618)
+    if coin.close >= coin.open:  # TOP PUMP → ưu tiên BUY LIMIT khi hồi
+        # Vùng hồi đẹp: 38.2% → 61.8% tính từ high xuống low
+        zone_high = coin.high - d_range * 0.382
+        zone_low  = coin.high - d_range * 0.618
+        limit_entry = (zone_high + zone_low) / 2.0
+
+        result.entry_zone_low = fmt(zone_low)
+        result.entry_zone_high = fmt(zone_high)
+        result.entry = fmt(limit_entry)
+        result.sl = fmt(coin.low - d_range * 0.10)
+
+        # TP tính từ vùng limit, TP1 ưu tiên retest high cũ để RR thực tế hơn
+        result.tp1 = fmt(max(coin.high, limit_entry + d_range * 0.382))
+        result.tp2 = fmt(coin.high + d_range * 0.500)
+        result.tp3 = fmt(coin.high + d_range * 1.000)
+
+        # Chỉ Entry Now khi giá không còn bị kéo quá xa khỏi vùng limit
+        dist_to_zone = (current - zone_high) / current * 100 if current > 0 else 999
+        in_or_near_zone = current <= zone_high * 1.01
+        result.entry_now_allowed = bool(in_or_near_zone)
+        result.entry_note = "Đợi hồi/retest, không chase đỉnh" if not in_or_near_zone else "Giá đã gần vùng hồi, có thể chia nhỏ"
+
+    else:  # TOP DUMP → ưu tiên SELL LIMIT khi hồi lên
+        # Vùng hồi đẹp: 38.2% → 61.8% tính từ low lên high
+        zone_low  = coin.low + d_range * 0.382
+        zone_high = coin.low + d_range * 0.618
+        limit_entry = (zone_low + zone_high) / 2.0
+
+        result.entry_zone_low = fmt(zone_low)
+        result.entry_zone_high = fmt(zone_high)
+        result.entry = fmt(limit_entry)
+        result.sl = fmt(coin.high + d_range * 0.10)
+
+        # TP tính từ vùng limit, TP1 ưu tiên retest low cũ
+        result.tp1 = fmt(min(coin.low, limit_entry - d_range * 0.382))
+        result.tp2 = fmt(coin.low - d_range * 0.500)
+        result.tp3 = fmt(coin.low - d_range * 1.000)
+
+        # Chỉ Entry Now khi giá đã hồi gần vùng short limit, không short đuổi đáy
+        in_or_near_zone = current >= zone_low * 0.99
+        result.entry_now_allowed = bool(in_or_near_zone)
+        result.entry_note = "Đợi hồi/retest, không short đuổi đáy" if not in_or_near_zone else "Giá đã gần vùng hồi, có thể chia nhỏ"
+
+    # RR tham khảo theo entry limit
+    risk = abs(result.entry - result.sl) if result.entry and result.sl else 0
+    if risk > 0:
+        result.rr_tp1 = round(abs(result.tp1 - result.entry) / risk, 2) if result.tp1 else 0
+        result.rr_tp2 = round(abs(result.tp2 - result.entry) / risk, 2) if result.tp2 else 0
 
 
 def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
@@ -2887,26 +2936,29 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
         return f"{(t - e) / e * 100:+.2f}%"
 
     def entry_block(r: ScoreResult, side: str) -> str:
-        """Tách Entry Now / Entry Limit.
-        - Entry Now = giá hiện tại, chỉ OK nếu không lệch quá xa ideal entry.
-        - Entry Limit = entry chiến lược/retest.
+        """Hiển thị Entry Now / Entry Limit Zone.
+        TOP PUMP/DUMP luôn ưu tiên limit để tránh vào ngay lúc FOMO/panic.
         """
         current = r.price_current or 0
-        limit_entry = r.entry or current
-        dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
-
-        now_line = f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
-        if dist_pct > 3.0:
-            now_line = f"⚡ Entry Now: <b>Không chase</b>"
+        now_label = "Có thể chia nhỏ" if r.entry_now_allowed else "Không chase"
+        zone_low = r.entry_zone_low or r.entry
+        zone_high = r.entry_zone_high or r.entry
+        zone_txt = f"{fmt_price(zone_low)} → {fmt_price(zone_high)}" if zone_low and zone_high and zone_low != zone_high else fmt_price(r.entry)
 
         if side == "LONG":
-            limit_label = "🎯 Entry Limit"
+            limit_label = "🎯 Buy Limit Zone"
+            confirm = "✅ Confirm: OI giữ, M30 tạo higher low, funding chưa flip dương mạnh"
         else:
-            limit_label = "🎯 Entry Limit"
+            limit_label = "🎯 Sell Limit Zone"
+            confirm = "✅ Confirm: OI giữ, M30 tạo lower high, funding chưa flip âm quá sâu"
 
+        note = html.escape(r.entry_note or "Ưu tiên limit/retest")
         return (
-            f"{now_line}\n"
-            f"{limit_label}: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
+            f"⚡ Entry Now: <b>{now_label}</b> | Giá hiện tại: <b>{fmt_price(current)}</b>\n"
+            f"{limit_label}: <b>{zone_txt}</b>\n"
+            f"📍 Entry chuẩn: <b>{fmt_price(r.entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>\n"
+            f"🧠 Ghi chú: <i>{note}</i>\n"
+            f"{confirm}"
         )
 
     # ── PUMP SECTION: chỉ hiện khi có kết quả ───────────────────
@@ -3032,6 +3084,10 @@ def save_results(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             "price_current": r.price_current,
             "day_low": r.day_low,
             "entry": r.entry,
+            "entry_zone_low": r.entry_zone_low,
+            "entry_zone_high": r.entry_zone_high,
+            "entry_now_allowed": r.entry_now_allowed,
+            "entry_note": r.entry_note,
             "sl": r.sl,
             "tp1": r.tp1,
             "tp2": r.tp2,
