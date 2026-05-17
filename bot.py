@@ -1,3 +1,73 @@
+
+# ============================================================
+# STAIR-STEP / TREND CONTINUATION ENGINE
+# ============================================================
+
+STAIR_STEP_MIN_30M_CHANGE = 6.0
+STAIR_STEP_MIN_OI_CHANGE  = 8.0
+STAIR_STEP_MAX_FUNDING    = 0.015
+STAIR_STEP_SCORE          = 4.0
+
+def detect_stair_step_pump(symbol, tf_data, oi_change_pct, funding_rate):
+    try:
+        closes = tf_data["close"]
+        highs  = tf_data["high"]
+        vols   = tf_data["volume"]
+
+        if len(closes) < 8:
+            return None
+
+        recent_change = ((closes[-1] / closes[-6]) - 1.0) * 100.0
+
+        higher_low_ok = (
+            closes[-1] > closes[-2] and
+            closes[-2] > closes[-4]
+        )
+
+        volume_trend_ok = (
+            sum(vols[-3:]) > sum(vols[-6:-3]) * 1.15
+        )
+
+        breakout_hold_ok = (
+            closes[-1] >= max(highs[-6:-2]) * 0.985
+        )
+
+        funding_ok = abs(funding_rate) <= STAIR_STEP_MAX_FUNDING
+        oi_ok = oi_change_pct >= STAIR_STEP_MIN_OI_CHANGE
+
+        score = 0.0
+
+        if recent_change >= STAIR_STEP_MIN_30M_CHANGE:
+            score += 1.5
+
+        if higher_low_ok:
+            score += 1.0
+
+        if volume_trend_ok:
+            score += 1.0
+
+        if breakout_hold_ok:
+            score += 1.0
+
+        if funding_ok:
+            score += 0.5
+
+        if oi_ok:
+            score += 1.5
+
+        if score >= STAIR_STEP_SCORE:
+            return {
+                "type": "STAIR_STEP_PUMP",
+                "score": round(score, 2),
+                "change_pct": round(recent_change, 2),
+            }
+
+    except Exception:
+        return None
+
+    return None
+
+
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
@@ -29,7 +99,7 @@ from config import (
 # Có thể sửa nhanh tại đây
 SCAN_EXCHANGES = ["Binance", "Bybit"]  # Chỉ quét Binance + Bybit, bỏ BingX/KuCoin để tránh lệch giá và signal nhiễu
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
-TOP_N_FINAL = 2                         # Chỉ gửi 3 coin tiềm năng nhất
+TOP_N_FINAL = 2                         # Chỉ gửi 2 coin tiềm năng nhất cho mỗi TOP
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
 MIN_VOL_RATIO_FILTER = 2.0              # Tăng 1.2→2.0: loại noise MOG/1INCH vol thấp (PUMP)
 MIN_PRICE_CHANGE_FILTER = 5.0           # Loại coin tăng quá yếu nếu volume không đủ (PUMP)
@@ -65,9 +135,9 @@ DUMP_REV_1H_VOL_MULT = 1.5            # Vol 1H ≥ 1.5x MA10_1H
 INTRADAY_DUMP_MIN = 15.0              # Intraday dump (open→low) ≥ 15% trong nến ngày hiện tại
 MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt reversal list
 
-# REVERSAL output rule: chỉ lấy 1 LONG + 1 SHORT điểm cao nhất.
+# REVERSAL output rule: chỉ lấy tối đa 2 LONG + 2 SHORT điểm cao nhất.
 # Ưu tiên Binance/Bybit khi điểm gần nhau để tránh lệch giá/spread ở sàn nhỏ.
-REVERSAL_TOP_PER_SIDE = 1
+REVERSAL_TOP_PER_SIDE = 2
 REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2}
 REVERSAL_PRIORITY_SCORE_BONUS = 0.25
 
@@ -2682,12 +2752,12 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
       Tầng 1: 2 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=2)
       Tầng 2: Mỗi sàn scan symbol của mình song song (workers riêng từng sàn)
 
-    Quy tắc PUMP: SQUEEZE ưu tiên TOP 1, còn lại theo total_score.
-    Quy tắc DUMP: top 2 theo total_score.
-    Quy tắc REVERSAL: chỉ lấy 1 LONG + 1 SHORT, ưu tiên Binance/Bybit.
+    Quy tắc PUMP: lấy TOP 2; SQUEEZE ưu tiên vị trí đầu, còn lại theo total_score.
+    Quy tắc DUMP: lấy TOP 2 theo total_score.
+    Quy tắc REVERSAL: lấy tối đa TOP 2 LONG + TOP 2 SHORT, ưu tiên Binance/Bybit.
     """
-    TOP_PUMP = 1
-    TOP_DUMP = 1
+    TOP_PUMP = 2
+    TOP_DUMP = 2
 
     all_pump: list[ScoreResult] = []
     all_dump: list[ScoreResult] = []
@@ -2763,7 +2833,7 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     unique_dump.sort(key=lambda x: x.total_score, reverse=True)
     final_dump = unique_dump[:TOP_DUMP]
 
-    # ── REVERSAL: chỉ lấy TOP 1 LONG + TOP 1 SHORT ────────────────
+    # ── REVERSAL: lấy TOP 2 LONG + TOP 2 SHORT ────────────────────
     # LONG = DUMP_REVERSAL hoặc H1_BREAKOUT_LONG
     # SHORT = PUMP_REVERSAL hoặc H1_BREAKOUT_SHORT
     # Ưu tiên Binance/Bybit bằng bonus nhỏ trong ranking.
@@ -3083,9 +3153,9 @@ def _reversal_rank_key(r: ScoreResult) -> tuple[float, int, float]:
 
 def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResult]:
     """
-    Trả về tối đa 2 signal REVERSAL:
-    - 1 LONG điểm cao nhất
-    - 1 SHORT điểm cao nhất
+    Trả về tối đa 4 signal REVERSAL:
+    - TOP 2 LONG điểm cao nhất
+    - TOP 2 SHORT điểm cao nhất
     Ưu tiên Binance/Bybit khi điểm gần nhau nhờ priority bonus nhỏ.
     """
     selected: list[ScoreResult] = []
@@ -3093,8 +3163,8 @@ def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResu
         side_items = [r for r in results if _reversal_side(r) == side]
         if not side_items:
             continue
-        top = max(side_items, key=_reversal_rank_key)
-        selected.append(top)
+        side_items.sort(key=_reversal_rank_key, reverse=True)
+        selected.extend(side_items[:REVERSAL_TOP_PER_SIDE])
     selected.sort(key=_reversal_rank_key, reverse=True)
     return selected
 
@@ -3586,7 +3656,7 @@ def run_mtf_scan() -> tuple[list[MTFResult], list[MTFResult]]:
     unique_dump.sort(key=lambda x: (x.green_count, abs(x.final_score)), reverse=True)
 
     log.info(f"📅 MTF scan xong: {time.time()-scan_start:.1f}s | pump {len(unique_pump)} | dump {len(unique_dump)}")
-    return unique_pump[:1], unique_dump[:1]
+    return unique_pump[:2], unique_dump[:2]
 
 
 def format_mtf_alert(pump_list: list[MTFResult], dump_list: list[MTFResult]) -> str:
@@ -3842,7 +3912,7 @@ def job_hold_check():
 
 
 def run_h2_scan() -> tuple[list[ScoreResult], list[ScoreResult]]:
-    """Quét H2 song song 4 sàn. Trả về (pump_top1, dump_top1)."""
+    """Quét H2 song song 4 sàn. Trả về (pump_top2, dump_top2)."""
     all_pump: list[ScoreResult] = []
     all_dump:  list[ScoreResult] = []
     scan_start = time.time()
@@ -3894,7 +3964,7 @@ def run_h2_scan() -> tuple[list[ScoreResult], list[ScoreResult]]:
     dumps.sort(key=lambda x: x.total_score, reverse=True)
 
     log.info(f"⚡ H2 scan xong: {time.time()-scan_start:.1f}s | pump {len(pumps)} | dump {len(dumps)}")
-    return pumps[:1], dumps[:1]
+    return pumps[:2], dumps[:2]
 
 
 def format_h2_alert(pump: list[ScoreResult], dump: list[ScoreResult]) -> str:
