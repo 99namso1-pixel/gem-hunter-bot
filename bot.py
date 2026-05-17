@@ -29,7 +29,7 @@ from config import (
 # Có thể sửa nhanh tại đây
 SCAN_EXCHANGES = ["Binance", "Bybit"]  # Chỉ quét Binance + Bybit, bỏ BingX/KuCoin để tránh lệch giá và signal nhiễu
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
-TOP_N_FINAL = 3                         # Chỉ gửi 3 coin tiềm năng nhất
+TOP_N_FINAL = 2                         # Chỉ gửi 3 coin tiềm năng nhất
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
 MIN_VOL_RATIO_FILTER = 2.0              # Tăng 1.2→2.0: loại noise MOG/1INCH vol thấp (PUMP)
 MIN_PRICE_CHANGE_FILTER = 5.0           # Loại coin tăng quá yếu nếu volume không đủ (PUMP)
@@ -65,9 +65,9 @@ DUMP_REV_1H_VOL_MULT = 1.5            # Vol 1H ≥ 1.5x MA10_1H
 INTRADAY_DUMP_MIN = 15.0              # Intraday dump (open→low) ≥ 15% trong nến ngày hiện tại
 MIN_REVERSAL_SCORE = 3.0              # Điểm tối thiểu để lọt reversal list
 
-# REVERSAL output rule: lấy top 2 LONG + top 2 SHORT điểm cao nhất.
+# REVERSAL output rule: chỉ lấy 1 LONG + 1 SHORT điểm cao nhất.
 # Ưu tiên Binance/Bybit khi điểm gần nhau để tránh lệch giá/spread ở sàn nhỏ.
-REVERSAL_TOP_PER_SIDE = 2
+REVERSAL_TOP_PER_SIDE = 1
 REVERSAL_PRIORITY_EXCHANGES = {"Binance": 2, "Bybit": 2}
 REVERSAL_PRIORITY_SCORE_BONUS = 0.25
 
@@ -80,9 +80,9 @@ H2_SCAN_HOURS   = 2      # quét mỗi 2H
 # ── 1H Momentum Breakout ──────────────────────────────────────
 # Signal độc lập với 1D — bắt nến 1H pump/dump mạnh có vol spike
 # Ví dụ: MLNUSDT 07:00 UTC 14/5 — +10.37% vol 9.3x FR âm
-H1_BREAKOUT_MIN_CHG     = 8.0    # 1H thay đổi tối thiểu (pump hoặc dump)
-H1_BREAKOUT_MIN_VOL     = 5.0    # vol_ratio 1H tối thiểu (x MA10)
-H1_BREAKOUT_MIN_SCORE   = 4.0    # Điểm tối thiểu để alert
+H1_BREAKOUT_MIN_CHG     = 6.0    # FIX: bắt H1 breakout sớm hơn sau khi đóng nến
+H1_BREAKOUT_MIN_VOL     = 3.0    # FIX: giảm từ 5x xuống 3x để không miss vol spike
+H1_BREAKOUT_MIN_SCORE   = 3.0    # FIX: giảm score để alert H1 breakout sớm hơn
 H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 
 # Engine mode
@@ -233,11 +233,6 @@ class ScoreResult:
     tp3: float = 0
     rr_tp1: float = 0           # Risk:Reward tới TP1
     rr_tp2: float = 0           # Risk:Reward tới TP2
-    # Pullback detection fields
-    has_pullback: bool = False       # True nếu phát hiện có cú hồi đang diễn ra
-    pullback_pct: float = 0          # % hồi so với range (0-100%)
-    pullback_type: str = ""          # "RETRACING" | "CONTINUING" | "UNKNOWN"
-    limit_entry_fib: float = 0       # Entry limit tính theo Fibonacci retracement
     details: list = field(default_factory=list)
 
     @property
@@ -1198,93 +1193,6 @@ def classify_market_mode(result: ScoreResult, coin: CoinData, vol_ratio: float) 
     elif result.market_mode == "TREND":
         result.total_score += 0.4
 
-def detect_pullback(result: ScoreResult, coin: CoinData, side: str) -> None:
-    """
-    Phát hiện lực hồi trên khung M30/1H để quyết định Entry Now hay Entry Limit.
-
-    Logic:
-    ─────────────────────────────────────────────────────────────────────
-    SHORT signal (DUMP / PUMP_REVERSAL):
-      • Nếu M30 hoặc 1H đang xanh (giá hồi lên từ đáy) → có lực hồi
-        → has_pullback = True, dùng Entry Limit (chờ hồi xong mới short)
-        → limit_entry_fib = close + (high - close) * 0.382 (hồi 38.2%)
-      • Nếu M30 tiếp tục đỏ, momentum chưa hồi → Entry Now luôn
-
-    LONG signal (REVERSAL LONG):
-      • Nếu M30 đang đỏ sau khi bật lên (pullback từ đỉnh 1H) → có lực hồi nhỏ
-        → has_pullback = True, Entry Limit thấp hơn (chờ hồi xuống vào)
-        → limit_entry_fib = close - (close - low) * 0.382
-      • Nếu M30 xanh liên tiếp → Entry Now
-
-    Kết quả ghi vào: result.has_pullback, result.pullback_pct,
-                     result.pullback_type, result.limit_entry_fib
-    ─────────────────────────────────────────────────────────────────────
-    """
-    import math
-
-    def _sig_digits(v: float) -> float:
-        if v <= 0:
-            return 0.0
-        digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
-        return round(v, digits)
-
-    # ── Lấy dữ liệu M30 / 1H ────────────────────────────────────────────
-    m30_chg      = coin.m30_price_change_pct if coin.m30_available else 0.0
-    m30_prev_chg = coin.m30_prev_change_pct  if coin.m30_available else 0.0
-    h1_chg       = coin.h1_price_change_pct  if coin.h1_available  else 0.0
-
-    # Tỷ lệ hồi tương đối so với range nến ngày
-    d_range  = coin.high - coin.low   if coin.high > coin.low  else 0
-    h1_range = coin.h1_high - coin.h1_low if coin.h1_available and coin.h1_high > coin.h1_low else 0
-
-    if side == "SHORT":
-        # ── SHORT: phát hiện hồi lên ────────────────────────────────────
-        # Điều kiện có lực hồi: M30 đang xanh, HOẶC 1H đang xanh (giá bật từ đáy)
-        m30_retracing = coin.m30_available and m30_chg > 0.5   # M30 đang xanh > 0.5%
-        h1_retracing  = coin.h1_available  and h1_chg  > 1.0   # 1H đang xanh > 1%
-
-        if m30_retracing or h1_retracing:
-            result.has_pullback   = True
-            result.pullback_type  = "RETRACING"
-
-            # Tính % hồi so với range ngày
-            rebound_chg = max(m30_chg if m30_retracing else 0, h1_chg if h1_retracing else 0)
-            result.pullback_pct = round(rebound_chg, 2)
-
-            # Entry Limit = giá hiện tại + hồi thêm theo Fibonacci 38.2% range ngày
-            # Ý nghĩa: chờ giá hồi lên vùng 38.2% rồi short, không entry now
-            if d_range > 0 and coin.close > 0:
-                fib_382 = coin.close + d_range * 0.382
-                fib_500 = coin.close + d_range * 0.500
-                # Chọn vùng giữa: hồi 38.2%-50% là vùng short an toàn
-                result.limit_entry_fib = _sig_digits(fib_382)
-
-        else:
-            result.has_pullback  = False
-            result.pullback_type = "CONTINUING"  # Dump đang tiếp tục, entry now
-
-    else:  # LONG
-        # ── LONG: phát hiện hồi xuống (sau khi bật) ─────────────────────
-        # Nếu M30 đang đỏ sau khi 1H bật lên = giá đang hồi nhỏ → có thể chờ vào rẻ hơn
-        m30_pulling_back = coin.m30_available and m30_chg < -0.5  # M30 đỏ > 0.5%
-        m30_two_red      = coin.m30_available and m30_chg < 0 and m30_prev_chg < 0
-
-        if m30_pulling_back and coin.h1_available and h1_chg > 2.0:
-            # 1H xanh mạnh nhưng M30 đang kéo lại = pullback nhỏ
-            result.has_pullback   = True
-            result.pullback_type  = "RETRACING"
-            result.pullback_pct   = round(abs(m30_chg), 2)
-
-            # Entry Limit = giá hiện tại - hồi xuống theo Fibonacci 23.6%-38.2% range 1H
-            if h1_range > 0 and coin.h1_close > 0:
-                fib_236 = coin.h1_close - h1_range * 0.236
-                result.limit_entry_fib = _sig_digits(max(fib_236, coin.h1_close * 0.95))
-
-        else:
-            result.has_pullback  = False
-            result.pullback_type = "CONTINUING"  # Đang bật mạnh, entry now
-
-
 def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
     """Tính Entry/SL/TP cho pump/dump từ range nến D."""
     import math
@@ -1497,7 +1405,6 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < MIN_SCORE:
         return None
     calc_pump_tp_sl(result, coin)
-    detect_pullback(result, coin, "LONG")
     return result
 def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
     """Score coin tiềm năng DUMP (nến đỏ, momentum giảm mạnh)."""
@@ -1650,7 +1557,6 @@ def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < MIN_DUMP_SCORE:
         return None
     calc_pump_tp_sl(result, coin)
-    detect_pullback(result, coin, "SHORT")
     return result
 
 
@@ -2063,10 +1969,6 @@ def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
     # Tính TP/SL dựa trên momentum 1H
     calc_reversal_tp(result, coin)
 
-    # Phát hiện lực hồi để quyết định Entry Now hay Entry Limit
-    rev_side = "LONG" if result.reversal_type == "DUMP_REVERSAL" else "SHORT"
-    detect_pullback(result, coin, rev_side)
-
     return result
 
 
@@ -2286,12 +2188,10 @@ def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
         result.reversal_type = "DUMP_REVERSAL"   # map tạm để dùng LONG formula
         calc_reversal_tp(result, coin)
         result.reversal_type = "H1_BREAKOUT_LONG"
-        detect_pullback(result, coin, "LONG")
     else:
         result.reversal_type = "PUMP_REVERSAL"   # map tạm để dùng SHORT formula
         calc_reversal_tp(result, coin)
         result.reversal_type = "H1_BREAKOUT_SHORT"
-        detect_pullback(result, coin, "SHORT")
 
     return result
 
@@ -2786,8 +2686,8 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     Quy tắc DUMP: top 2 theo total_score.
     Quy tắc REVERSAL: chỉ lấy 1 LONG + 1 SHORT, ưu tiên Binance/Bybit.
     """
-    TOP_PUMP = 2
-    TOP_DUMP = 2
+    TOP_PUMP = 1
+    TOP_DUMP = 1
 
     all_pump: list[ScoreResult] = []
     all_dump: list[ScoreResult] = []
@@ -2917,65 +2817,27 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
         return f"{(t - e) / e * 100:+.2f}%"
 
     def entry_block(r: ScoreResult, side: str) -> str:
-        """Tách Entry Now / Entry Limit dựa trên lực hồi.
-
-        Logic mới:
-        ─────────────────────────────────────────────────────────────────
-        SHORT:
-          • Có lực hồi (has_pullback=True, pullback_type=RETRACING):
-            → Entry Now: KHÔNG (đang hồi lên, chờ)
-            → Entry Limit: dùng limit_entry_fib (vùng hồi 38.2%) hoặc r.entry
-
-          • Không có lực hồi (CONTINUING):
-            → Entry Now: giá hiện tại (momentum dump đang tiếp diễn)
-            → Bỏ Entry Limit (đã entry now rồi)
-
-        LONG:
-          • Có lực hồi nhỏ (M30 kéo lại):
-            → Entry Now: giá hiện tại (có thể bắt ngay nếu muốn)
-            → Entry Limit: vùng hồi 23.6%-38.2% thấp hơn (vào rẻ hơn)
-
-          • Không có lực hồi (đang bật mạnh):
-            → Entry Now: giá hiện tại
-            → Bỏ Entry Limit
-        ─────────────────────────────────────────────────────────────────
+        """Tách Entry Now / Entry Limit.
+        - Entry Now = giá hiện tại, chỉ OK nếu không lệch quá xa ideal entry.
+        - Entry Limit = entry chiến lược/retest.
         """
-        current     = r.price_current or 0
+        current = r.price_current or 0
         limit_entry = r.entry or current
-
-        # Dist giữa giá hiện tại và limit entry
         dist_pct = abs(current - limit_entry) / limit_entry * 100 if limit_entry > 0 else 0
 
-        sl_txt = f"SL: <b>{fmt_price(r.sl)}</b>"
+        now_line = f"⚡ Entry Now: <b>{fmt_price(current)}</b>"
+        if dist_pct > 3.0:
+            now_line = f"⚡ Entry Now: <b>Không chase</b>"
 
-        if side == "SHORT":
-            if r.has_pullback and r.pullback_type == "RETRACING":
-                # Đang hồi lên → chỉ hiện Entry Limit (chờ hồi xong mới short)
-                pullback_note = f"+{r.pullback_pct:.1f}%" if r.pullback_pct > 0 else ""
-                fib_limit = r.limit_entry_fib if r.limit_entry_fib > 0 else limit_entry
-                return (
-                    f"⏳ Đang hồi {pullback_note} — chờ short\n"
-                    f"🎯 Entry Limit: <b>{fmt_price(fib_limit)}</b> | {sl_txt}"
-                )
-            else:
-                # Dump tiếp tục → chỉ hiện Entry Now, không có Limit
-                return (
-                    f"⚡ Entry Now: <b>{fmt_price(current)}</b> | {sl_txt}"
-                )
+        if side == "LONG":
+            limit_label = "🎯 Entry Limit"
+        else:
+            limit_label = "🎯 Entry Limit"
 
-        else:  # LONG
-            if r.has_pullback and r.pullback_type == "RETRACING":
-                # M30 đang kéo lại → chỉ hiện Entry Limit (chờ giá về vùng rẻ hơn)
-                fib_limit = r.limit_entry_fib if r.limit_entry_fib > 0 else limit_entry
-                return (
-                    f"⏳ M30 đang kéo lại — chờ long\n"
-                    f"🎯 Entry Limit: <b>{fmt_price(fib_limit)}</b> | {sl_txt}"
-                )
-            else:
-                # Bật mạnh → chỉ hiện Entry Now, không có Limit
-                if dist_pct > 3.0:
-                    return f"⚡ Entry Now: <b>Không chase</b> | {sl_txt}"
-                return f"⚡ Entry Now: <b>{fmt_price(current)}</b> | {sl_txt}"
+        return (
+            f"{now_line}\n"
+            f"{limit_label}: <b>{fmt_price(limit_entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>"
+        )
 
     # ── PUMP SECTION: chỉ hiện khi có kết quả ───────────────────
     if pump_results:
@@ -3006,9 +2868,9 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
                     f"{entry_block(r, 'LONG')}\n"
-                    f"1️⃣ TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
-                    f"2️⃣ TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
-                    f"3️⃣ TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
 
@@ -3036,9 +2898,9 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
                     f"{entry_block(r, 'SHORT')}\n"
-                    f"1️⃣ TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
-                    f"2️⃣ TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
-                    f"3️⃣ TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
 
@@ -3062,9 +2924,9 @@ def format_alert(pump_results: list[ScoreResult], dump_results: list[ScoreResult
             if r.entry > 0 and r.tp1 > 0:
                 lines.append(
                     f"{entry_block(r, side)}\n"
-                    f"1️⃣ TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
-                    f"2️⃣ TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
-                    f"3️⃣ TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+                    f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                    f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                    f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
                 )
             lines.append("")
 
@@ -3221,9 +3083,9 @@ def _reversal_rank_key(r: ScoreResult) -> tuple[float, int, float]:
 
 def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResult]:
     """
-    Trả về tối đa 4 signal REVERSAL:
-    - top 2 LONG điểm cao nhất
-    - top 2 SHORT điểm cao nhất
+    Trả về tối đa 2 signal REVERSAL:
+    - 1 LONG điểm cao nhất
+    - 1 SHORT điểm cao nhất
     Ưu tiên Binance/Bybit khi điểm gần nhau nhờ priority bonus nhỏ.
     """
     selected: list[ScoreResult] = []
@@ -3231,8 +3093,8 @@ def select_top_reversal_long_short(results: list[ScoreResult]) -> list[ScoreResu
         side_items = [r for r in results if _reversal_side(r) == side]
         if not side_items:
             continue
-        top_n = sorted(side_items, key=_reversal_rank_key, reverse=True)[:REVERSAL_TOP_PER_SIDE]
-        selected.extend(top_n)
+        top = max(side_items, key=_reversal_rank_key)
+        selected.append(top)
     selected.sort(key=_reversal_rank_key, reverse=True)
     return selected
 
@@ -3277,23 +3139,11 @@ def format_reversal_alert(rev_results: list[ScoreResult]) -> str:
             f"💰 Giá: <b>{r.price_current:.6g}</b> | 1H: {r.h1_chg:+.2f}% | M30: {r.m30_chg:+.2f}%"
         )
         if r.entry > 0 and r.tp1 > 0:
-            sl_txt = f"SL: <b>{r.sl:.6g}</b>"
-            if r.has_pullback and r.pullback_type == "RETRACING":
-                pb_dir  = f"+{r.pullback_pct:.1f}%" if not is_long else f"-{r.pullback_pct:.1f}%"
-                fib_e   = r.limit_entry_fib if r.limit_entry_fib > 0 else r.entry
-                fib_tag = " (Fib 38.2%)" if fib_e != r.entry else ""
-                entry_line = (
-                    f"⏳ Đang hồi {pb_dir} — chờ {'long' if is_long else 'short'}\n"
-                    f"🎯 Entry Limit: <b>{fib_e:.6g}</b>{fib_tag} | {sl_txt}"
-                )
-            else:
-                entry_line = f"⚡ Entry Now: <b>{r.entry:.6g}</b> | {sl_txt}"
-
             lines.append(
-                f"{entry_line}\n"
-                f"1️⃣ TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
-                f"2️⃣ TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
-                f"3️⃣ TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
+                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
             )
         lines.append("")
 
@@ -3763,9 +3613,9 @@ def format_mtf_alert(pump_list: list[MTFResult], dump_list: list[MTFResult]) -> 
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
                 f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                f"1️⃣ TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
-                f"2️⃣ TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
-                f"3️⃣ TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)})\n"
+                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
             )
         lines.append("")
 
@@ -4072,9 +3922,9 @@ def format_h2_alert(pump: list[ScoreResult], dump: list[ScoreResult]) -> str:
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
                 f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                f"1️⃣ TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
-                f"2️⃣ TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
-                f"3️⃣ TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
+                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
+                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
+                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
             )
         lines.append("")
 
