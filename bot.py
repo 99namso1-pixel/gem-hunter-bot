@@ -4253,6 +4253,8 @@ MONITOR_CVD_BEARISH_BARS = 2          # LONG: >=2/3 nến signed volume âm = x�
 MONITOR_CVD_BULLISH_BARS = 2          # SHORT: >=2/3 nến signed volume dương = xấu
 MONITOR_FUNDING_LONG_MAX = 0.08       # LONG: funding > 0.08% = crowded long, xấu
 MONITOR_FUNDING_SHORT_MIN = -0.08     # SHORT: funding < -0.08% = crowded short, xấu
+MONITOR_TP_ALERTS_ENABLED = True        # Bật alert khi chạm TP1/TP2/TP3
+MONITOR_REMOVE_AFTER_TP3 = True         # Chạm TP3 thì kết thúc monitor signal đó để tránh spam
 
 
 def _active_trade_key(exchange: str, symbol: str, side: str) -> str:
@@ -4331,6 +4333,10 @@ def register_active_trades(results: list[ScoreResult], source: str = "SCAN") -> 
             "last_check": "",
             "last_status": "WAITING_LIMIT" if is_limit_zone else "FILLED",
             "exit_alerted": False,
+            "tp1_alerted": False,
+            "tp2_alerted": False,
+            "tp3_alerted": False,
+            "tp_hit_max": 0,
         }
         added += 1
 
@@ -4376,6 +4382,7 @@ def monitor_active_trades() -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     exit_blocks = []
     status_blocks = []
+    tp_blocks = []
     changed = False
 
     def _fmt(v: float) -> str:
@@ -4394,6 +4401,9 @@ def monitor_active_trades() -> None:
         if zone_low > zone_high:
             zone_low, zone_high = zone_high, zone_low
         sl = float(t.get("sl", 0) or 0)
+        tp1 = float(t.get("tp1", 0) or 0)
+        tp2 = float(t.get("tp2", 0) or 0)
+        tp3 = float(t.get("tp3", 0) or 0)
         filled = bool(t.get("filled", False))
 
         if not symbol or not exchange or entry <= 0:
@@ -4405,6 +4415,8 @@ def monitor_active_trades() -> None:
                 continue
             last = candles[-1]
             price = float(last.get("c", 0))
+            bar_high = float(last.get("h", price) or price)
+            bar_low = float(last.get("l", price) or price)
             if price <= 0:
                 continue
 
@@ -4464,6 +4476,45 @@ def monitor_active_trades() -> None:
             pnl_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
             t["last_pnl_pct"] = pnl_pct
             changed = True
+
+            # ── TP ALERTS: chỉ báo 1 lần cho từng mốc TP sau khi đã FILLED ─────────
+            if MONITOR_TP_ALERTS_ENABLED:
+                tp_hits = []
+                if side == "LONG":
+                    if tp1 > 0 and bar_high >= tp1 and not t.get("tp1_alerted", False):
+                        tp_hits.append((1, tp1, "TP1 HIT — có thể chốt 30–50%, dời SL về entry"))
+                    if tp2 > 0 and bar_high >= tp2 and not t.get("tp2_alerted", False):
+                        tp_hits.append((2, tp2, "TP2 HIT — chốt thêm, giữ phần còn lại"))
+                    if tp3 > 0 and bar_high >= tp3 and not t.get("tp3_alerted", False):
+                        tp_hits.append((3, tp3, "TP3 HIT — đạt full target"))
+                else:
+                    if tp1 > 0 and bar_low <= tp1 and not t.get("tp1_alerted", False):
+                        tp_hits.append((1, tp1, "TP1 HIT — có thể chốt 30–50%, dời SL về entry"))
+                    if tp2 > 0 and bar_low <= tp2 and not t.get("tp2_alerted", False):
+                        tp_hits.append((2, tp2, "TP2 HIT — chốt thêm, giữ phần còn lại"))
+                    if tp3 > 0 and bar_low <= tp3 and not t.get("tp3_alerted", False):
+                        tp_hits.append((3, tp3, "TP3 HIT — đạt full target"))
+
+                if tp_hits:
+                    side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
+                    hit_lines = []
+                    for n, tp_price, note in tp_hits:
+                        t[f"tp{n}_alerted"] = True
+                        t["tp_hit_max"] = max(int(t.get("tp_hit_max", 0) or 0), n)
+                        hit_pct = (tp_price - entry) / entry * 100 if side == "LONG" else (entry - tp_price) / entry * 100
+                        hit_lines.append(f"🎯 <b>TP{n}: {_fmt(tp_price)}</b> ({hit_pct:+.2f}%) — {html.escape(note)}")
+
+                    if MONITOR_REMOVE_AFTER_TP3 and t.get("tp3_alerted", False):
+                        t["exit_alerted"] = True
+                        t["last_status"] = "TP3_DONE"
+
+                    changed = True
+                    tp_blocks.append(
+                        f"🎯 <b>TAKE PROFIT HIT</b>\n"
+                        f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
+                        f"Entry: <b>{_fmt(entry)}</b> | Giá hiện tại: <b>{_fmt(price)}</b>\n"
+                        + "\n".join(hit_lines)
+                    )
 
             reasons = []
             if side == "LONG":
