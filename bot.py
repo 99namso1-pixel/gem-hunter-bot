@@ -1,4 +1,3 @@
-
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -4278,6 +4277,31 @@ def _save_active_trades(data: dict) -> None:
         log.warning(f"Không lưu được {ACTIVE_TRADES_FILE}: {e}")
 
 
+CLOSED_TRADES_FILE = "closed_trades.json"
+
+
+def _append_closed_trade(key: str, trade: dict, reason: str) -> None:
+    """Lưu kèo đã đóng vào closed_trades.json để giữ lịch sử."""
+    try:
+        try:
+            with open(CLOSED_TRADES_FILE, "r", encoding="utf-8") as f:
+                closed = json.load(f)
+            if not isinstance(closed, list):
+                closed = []
+        except Exception:
+            closed = []
+
+        trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+        trade["close_reason"] = reason
+        trade["_key"] = key
+        closed.append(trade)
+
+        with open(CLOSED_TRADES_FILE, "w", encoding="utf-8") as f:
+            json.dump(closed, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Không lưu được {CLOSED_TRADES_FILE}: {e}")
+
+
 def _result_side_for_hold(r: ScoreResult) -> str:
     side = _reversal_side(r) if getattr(r, "reversal_type", "") else ""
     if side:
@@ -4389,9 +4413,6 @@ def monitor_active_trades() -> None:
         return f"{v:.6g}" if v and v > 0 else "-"
 
     for key, t in list(data.items()):
-        if t.get("exit_alerted"):
-            continue
-
         symbol = t.get("symbol")
         exchange = t.get("exchange")
         side = t.get("side", "LONG")
@@ -4505,8 +4526,9 @@ def monitor_active_trades() -> None:
                         hit_lines.append(f"🎯 <b>TP{n}: {_fmt(tp_price)}</b> ({hit_pct:+.2f}%) — {html.escape(note)}")
 
                     if MONITOR_REMOVE_AFTER_TP3 and t.get("tp3_alerted", False):
-                        t["exit_alerted"] = True
                         t["last_status"] = "TP3_DONE"
+                        _append_closed_trade(key, dict(t), "TP3_DONE")
+                        del data[key]
 
                     changed = True
                     tp_blocks.append(
@@ -4540,6 +4562,8 @@ def monitor_active_trades() -> None:
                 t["exit_alerted"] = True
                 t["last_status"] = "EXIT_ALERTED"
                 changed = True
+                _append_closed_trade(key, dict(t), "EXIT_ALERTED")
+                del data[key]
                 side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
                 exit_blocks.append(
                     f"🚨 <b>THOÁT NGAY</b>\n"
