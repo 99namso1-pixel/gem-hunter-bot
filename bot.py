@@ -1,3 +1,4 @@
+
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -2814,6 +2815,227 @@ def _smart_round(v: float) -> float:
     digits = max(2, -int(math.floor(math.log10(abs(v)))) + 4)
     return round(v, digits)
 
+
+# ============================================================
+# EARLY MTF ENGINE — BẮT LONG/SHORT SỚM SAU KHI ĐÓNG NẾN D
+# ============================================================
+
+EARLY_MTF_MIN_SCORE = 6.0
+
+
+def get_ohlcv_h4(exchange: str, symbol: str, limit: int = 12) -> Optional[list]:
+    return _get_ohlcv_interval(exchange, symbol, "4h", "240", "4h", 240, limit)
+
+
+def _body_pct(o, c):
+    return abs(c - o) / max(o, 1e-12) * 100
+
+
+def _upper_wick_ratio(o, h, l, c):
+    rng = h - l
+    return 0 if rng <= 0 else (h - max(o, c)) / rng
+
+
+def _lower_wick_ratio(o, h, l, c):
+    rng = h - l
+    return 0 if rng <= 0 else (min(o, c) - l) / rng
+
+
+def _calc_short_tp_sl_from_range(result: ScoreResult, entry: float, swing_high: float, swing_low: float):
+    result.entry = _smart_round(entry)
+    result.sl = _smart_round(swing_high * 1.012)
+    result.tp1 = _smart_round(entry - (entry - swing_low) * 0.55)
+    result.tp2 = _smart_round(swing_low)
+    result.tp3 = _smart_round(swing_low * 0.94)
+
+
+def _calc_long_tp_sl_from_range(result: ScoreResult, entry: float, swing_high: float, swing_low: float):
+    result.entry = _smart_round(entry)
+    result.sl = _smart_round(swing_low * 0.988)
+    result.tp1 = _smart_round(entry + (swing_high - entry) * 0.55)
+    result.tp2 = _smart_round(swing_high)
+    result.tp3 = _smart_round(swing_high * 1.06)
+
+
+def score_early_mtf_short(coin: CoinData) -> Optional[ScoreResult]:
+    """Bắt SHORT sớm: D1 exhaustion + H12 distribution + H4/M30 trigger."""
+    candles_d = get_ohlcv(coin.exchange, coin.symbol, limit=8)
+    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=6)
+    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=8)
+    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=10)
+
+    if not candles_d or len(candles_d) < 4 or not h12 or len(h12) < 3 or not h4 or len(h4) < 3:
+        return None
+
+    d_prev = candles_d[-2]      # nến D đã đóng gần nhất
+    d_now = candles_d[-1]       # nến D hiện tại / đầu ngày mới
+    po, ph, pl, pc = map(float, [d_prev["o"], d_prev["h"], d_prev["l"], d_prev["c"]])
+    no, nh, nl, nc = map(float, [d_now["o"], d_now["h"], d_now["l"], d_now["c"]])
+
+    h12_last = h12[-1]
+    h12_prev = h12[-2]
+    h4_last = h4[-1]
+    m30_last = m30[-1] if m30 else None
+
+    h12_o, h12_h, h12_l, h12_c = map(float, [h12_last["o"], h12_last["h"], h12_last["l"], h12_last["c"]])
+    h12_prev_h = float(h12_prev["h"])
+    h4_o, h4_h, h4_l, h4_c = map(float, [h4_last["o"], h4_last["h"], h4_last["l"], h4_last["c"]])
+
+    score = 0.0
+    details = []
+
+    prev_chg = (pc - po) / max(po, 1e-12) * 100
+    now_chg = (nc - no) / max(no, 1e-12) * 100
+    fr_pct = coin.funding_rate * 100
+
+    # D1 context: pump mạnh hôm qua nhưng có dấu hiệu exhaustion/distribution.
+    if prev_chg >= 12:
+        score += 1.5
+        details.append(f"D1 pump hôm qua +{prev_chg:.1f}%")
+    if _upper_wick_ratio(po, ph, pl, pc) >= 0.35:
+        score += 1.5
+        details.append("D1 râu trên/exhaustion")
+    if fr_pct >= 0.02:
+        score += 1.0
+        details.append(f"Funding dương/crowded {fr_pct:.4f}%")
+    if coin.oi_change_pct >= 15 and now_chg <= 1:
+        score += 1.5
+        details.append(f"OI cao nhưng giá yếu ({coin.oi_change_pct:.1f}%)")
+
+    # H12 distribution.
+    if h12_h < h12_prev_h and h12_c < h12_o:
+        score += 2.0
+        details.append("H12 lower high + nến đỏ")
+    if h12_c < (h12_l + (h12_h - h12_l) * 0.45):
+        score += 1.0
+        details.append("H12 đóng yếu dưới mid-range")
+
+    # H4 breakdown trigger.
+    if h4_c < h4_o and h4_c < h12_l:
+        score += 2.0
+        details.append("H4 breakdown dưới H12 low")
+    elif h4_c < h4_o:
+        score += 1.0
+        details.append("H4 bắt đầu đỏ")
+
+    # M30 timing.
+    if m30_last:
+        m30_o, m30_c = float(m30_last["o"]), float(m30_last["c"])
+        if m30_c < m30_o:
+            score += 0.8
+            details.append("M30 confirm đỏ")
+
+    if score < EARLY_MTF_MIN_SCORE:
+        return None
+
+    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    r.total_score = round(score, 1)
+    r.signal_type = "🔻 EARLY MTF SHORT"
+    r.market_mode = "EARLY_DISTRIBUTION_SHORT"
+    r.reversal_type = "EARLY_MTF_SHORT"
+    r.timeframe = "MTF"
+    r.price_chg = round(now_chg, 2)
+    r.price_current = round(nc, 8)
+    r.fr = round(fr_pct, 4)
+    r.oi_chg_pct = round(coin.oi_change_pct, 1)
+    r.details = details
+
+    entry = nc
+    swing_high = max(ph, h12_h, h4_h)
+    swing_low = min(pl, h12_l, h4_l)
+    _calc_short_tp_sl_from_range(r, entry, swing_high, swing_low)
+    return r
+
+
+def score_early_mtf_long(coin: CoinData) -> Optional[ScoreResult]:
+    """Bắt LONG sớm: D1 absorption + H12 accumulation + H4/M30 trigger."""
+    candles_d = get_ohlcv(coin.exchange, coin.symbol, limit=8)
+    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=6)
+    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=8)
+    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=10)
+
+    if not candles_d or len(candles_d) < 4 or not h12 or len(h12) < 3 or not h4 or len(h4) < 3:
+        return None
+
+    d_prev = candles_d[-2]
+    d_now = candles_d[-1]
+    po, ph, pl, pc = map(float, [d_prev["o"], d_prev["h"], d_prev["l"], d_prev["c"]])
+    no, nh, nl, nc = map(float, [d_now["o"], d_now["h"], d_now["l"], d_now["c"]])
+
+    h12_last = h12[-1]
+    h12_prev = h12[-2]
+    h4_last = h4[-1]
+    m30_last = m30[-1] if m30 else None
+
+    h12_o, h12_h, h12_l, h12_c = map(float, [h12_last["o"], h12_last["h"], h12_last["l"], h12_last["c"]])
+    h12_prev_l = float(h12_prev["l"])
+    h4_o, h4_h, h4_l, h4_c = map(float, [h4_last["o"], h4_last["h"], h4_last["l"], h4_last["c"]])
+
+    score = 0.0
+    details = []
+
+    prev_chg = (pc - po) / max(po, 1e-12) * 100
+    now_chg = (nc - no) / max(no, 1e-12) * 100
+    fr_pct = coin.funding_rate * 100
+
+    # D1 context: dump mạnh hôm qua nhưng có absorption.
+    if prev_chg <= -10:
+        score += 1.5
+        details.append(f"D1 dump hôm qua {prev_chg:.1f}%")
+    if _lower_wick_ratio(po, ph, pl, pc) >= 0.35:
+        score += 1.5
+        details.append("D1 râu dưới/absorption")
+    if fr_pct <= -0.05:
+        score += 1.2
+        details.append(f"Funding âm sâu {fr_pct:.4f}%")
+    if coin.oi_change_pct >= 15 and now_chg >= -1:
+        score += 1.3
+        details.append(f"OI cao nhưng giá không giảm tiếp ({coin.oi_change_pct:.1f}%)")
+
+    # H12 accumulation / reclaim.
+    if h12_l > h12_prev_l and h12_c > h12_o:
+        score += 2.0
+        details.append("H12 higher low + nến xanh")
+    if h12_c > (h12_l + (h12_h - h12_l) * 0.55):
+        score += 1.0
+        details.append("H12 đóng khỏe trên mid-range")
+
+    # H4 breakout trigger.
+    if h4_c > h4_o and h4_c > h12_h:
+        score += 2.0
+        details.append("H4 breakout trên H12 high")
+    elif h4_c > h4_o:
+        score += 1.0
+        details.append("H4 bắt đầu xanh")
+
+    # M30 timing.
+    if m30_last:
+        m30_o, m30_c = float(m30_last["o"]), float(m30_last["c"])
+        if m30_c > m30_o:
+            score += 0.8
+            details.append("M30 confirm xanh")
+
+    if score < EARLY_MTF_MIN_SCORE:
+        return None
+
+    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    r.total_score = round(score, 1)
+    r.signal_type = "🚀 EARLY MTF LONG"
+    r.market_mode = "EARLY_ACCUMULATION_LONG"
+    r.reversal_type = "EARLY_MTF_LONG"
+    r.timeframe = "MTF"
+    r.price_chg = round(now_chg, 2)
+    r.price_current = round(nc, 8)
+    r.fr = round(fr_pct, 4)
+    r.oi_chg_pct = round(coin.oi_change_pct, 1)
+    r.details = details
+
+    entry = nc
+    swing_high = max(ph, h12_h, h4_h)
+    swing_low = min(pl, h12_l, h4_l)
+    _calc_long_tp_sl_from_range(r, entry, swing_high, swing_low)
+    return r
+
 def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     Optional[ScoreResult], Optional[ScoreResult], Optional[ScoreResult]
 ]:
@@ -2821,20 +3043,34 @@ def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     coin = fetch_coin_data(exchange, symbol)
     if coin is None:
         return None, None, None
+
     pump = score_coin_pump(coin)
     dump = score_coin_dump(coin)
+
+    # SHORT distribution cũ.
     dist = score_distribution_short(coin)
     if dist and (dump is None or dist.total_score >= dump.total_score):
         dump = dist
-    # Lấy signal tốt nhất: reversal hoặc h1_breakout
+
+    # EARLY MTF mới: bắt ngay sau khi đóng D và đầu nến D mới.
+    early_short = score_early_mtf_short(coin)
+    if early_short and (dump is None or early_short.total_score >= dump.total_score):
+        dump = early_short
+
+    early_long = score_early_mtf_long(coin)
+    if early_long and (pump is None or early_long.total_score >= pump.total_score):
+        pump = early_long
+
+    # Reversal / H1 breakout cũ.
     rev1 = score_reversal(coin)
     rev2 = score_h1_breakout(coin)
+
     if rev1 and rev2:
         reversal = rev1 if rev1.total_score >= rev2.total_score else rev2
     else:
         reversal = rev1 or rev2
-    return pump, dump, reversal
 
+    return pump, dump, reversal
 
 def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     log.info("=" * 60)
@@ -4277,31 +4513,6 @@ def _save_active_trades(data: dict) -> None:
         log.warning(f"Không lưu được {ACTIVE_TRADES_FILE}: {e}")
 
 
-CLOSED_TRADES_FILE = "closed_trades.json"
-
-
-def _append_closed_trade(key: str, trade: dict, reason: str) -> None:
-    """Lưu kèo đã đóng vào closed_trades.json để giữ lịch sử."""
-    try:
-        try:
-            with open(CLOSED_TRADES_FILE, "r", encoding="utf-8") as f:
-                closed = json.load(f)
-            if not isinstance(closed, list):
-                closed = []
-        except Exception:
-            closed = []
-
-        trade["closed_at"] = datetime.now(timezone.utc).isoformat()
-        trade["close_reason"] = reason
-        trade["_key"] = key
-        closed.append(trade)
-
-        with open(CLOSED_TRADES_FILE, "w", encoding="utf-8") as f:
-            json.dump(closed, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning(f"Không lưu được {CLOSED_TRADES_FILE}: {e}")
-
-
 def _result_side_for_hold(r: ScoreResult) -> str:
     side = _reversal_side(r) if getattr(r, "reversal_type", "") else ""
     if side:
@@ -4407,12 +4618,17 @@ def monitor_active_trades() -> None:
     exit_blocks = []
     status_blocks = []
     tp_blocks = []
+    closed_blocks = []
+    close_keys = []
     changed = False
 
     def _fmt(v: float) -> str:
         return f"{v:.6g}" if v and v > 0 else "-"
 
     for key, t in list(data.items()):
+        if t.get("exit_alerted"):
+            continue
+
         symbol = t.get("symbol")
         exchange = t.get("exchange")
         side = t.get("side", "LONG")
@@ -4526,9 +4742,14 @@ def monitor_active_trades() -> None:
                         hit_lines.append(f"🎯 <b>TP{n}: {_fmt(tp_price)}</b> ({hit_pct:+.2f}%) — {html.escape(note)}")
 
                     if MONITOR_REMOVE_AFTER_TP3 and t.get("tp3_alerted", False):
+                        t["exit_alerted"] = True
                         t["last_status"] = "TP3_DONE"
-                        _append_closed_trade(key, dict(t), "TP3_DONE")
-                        del data[key]
+                        close_keys.append(key)
+                        closed_blocks.append(
+                            f"✅ <b>MONITOR CLOSED</b>\n"
+                            f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
+                            f"Reason: <b>TP3 HIT</b>"
+                        )
 
                     changed = True
                     tp_blocks.append(
@@ -4561,9 +4782,8 @@ def monitor_active_trades() -> None:
             if reasons:
                 t["exit_alerted"] = True
                 t["last_status"] = "EXIT_ALERTED"
+                close_keys.append(key)
                 changed = True
-                _append_closed_trade(key, dict(t), "EXIT_ALERTED")
-                del data[key]
                 side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
                 exit_blocks.append(
                     f"🚨 <b>THOÁT NGAY</b>\n"
@@ -4573,17 +4793,27 @@ def monitor_active_trades() -> None:
                     f"SL: <b>{_fmt(sl)}</b> | Funding: <b>{funding_pct:.4f}%</b>\n"
                     f"Lý do: {html.escape(', '.join(reasons))}"
                 )
+                closed_blocks.append(
+                    f"✅ <b>MONITOR CLOSED</b>\n"
+                    f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
+                    f"Reason: <b>{html.escape(', '.join(reasons))}</b>"
+                )
         except Exception as e:
             log.debug(f"Monitor lỗi {key}: {e}")
+
+    if close_keys:
+        for k in set(close_keys):
+            data.pop(k, None)
+        changed = True
 
     if changed:
         _save_active_trades(data)
 
-    blocks = status_blocks + exit_blocks
+    blocks = status_blocks + tp_blocks + exit_blocks + closed_blocks
     if blocks:
         msg = f"👁️ <b>MONITOR 30M — {now}</b>\n\n" + "\n\n".join(blocks)
         if send_telegram(msg):
-            log.info(f"👁️ Monitor gửi alert: filled={len(status_blocks)}, exit={len(exit_blocks)}")
+            log.info(f"👁️ Monitor gửi alert: filled={len(status_blocks)}, tp={len(tp_blocks)}, exit={len(exit_blocks)}, closed={len(closed_blocks)}")
         else:
             log.error("❌ Monitor gửi alert thất bại")
     else:
