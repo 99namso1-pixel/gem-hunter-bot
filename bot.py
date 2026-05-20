@@ -174,8 +174,8 @@ VIOLENT_SQ_SCORE_BONUS = 3.2
 
 # Tăng tốc scan
 FAST_SCAN = True
-MAX_WORKERS_BINANCE = 4    # Giảm để tránh Binance 429 Too Many Requests
-MAX_WORKERS_BYBIT  = 6    # Giảm vì chỉ scan coin Bybit chưa có trên Binance
+MAX_WORKERS_BINANCE = 7    # V7.9: tăng vừa phải vì đã có prefilter, vẫn tránh 429
+MAX_WORKERS_BYBIT  = 8    # V7.9: Bybit chỉ scan coin chưa có trên Binance + prefilter
 MAX_WORKERS_BINGX  = 6    # BingX limit 10 req/s thực tế
 MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
@@ -183,6 +183,18 @@ KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
 # Số workers tối đa cho parallel exchange scan (3 sàn chạy đồng thời)
 MAX_WORKERS_EXCHANGES = 1  # Scan tuần tự để tránh rate-limit và skip coin trùng Binance→Bybit
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
+
+# ── V7.9 Speed Prefilter ──────────────────────────────────────
+# Quét nhanh 24h ticker trước, chỉ full-score các coin đang thật sự có biến động.
+# Mục tiêu: giảm thời gian từ ~6 phút xuống khoảng 1-2 phút và vẫn bắt EDEN/BLUAI/violent moves.
+FAST_PREFILTER_ENABLED = True
+PREFILTER_MIN_ABS_CHG = 3.5              # vẫn giữ coin mới bắt đầu chạy/sập
+PREFILTER_MAX_SYMBOLS_BINANCE = 140      # Binance top candidates để full scan
+PREFILTER_MAX_SYMBOLS_BYBIT = 90         # Bybit chỉ phần không trùng Binance
+PREFILTER_TOP_GAINERS = 70
+PREFILTER_TOP_LOSERS = 70
+PREFILTER_TOP_VOLUME = 45
+PREFILTER_KEEP_ALWAYS = {"EDEN", "BLUAI", "RONIN", "CGPT"}  # watchlist luôn giữ nếu có symbol
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -485,6 +497,102 @@ def normalize_symbol_base(symbol: str) -> str:
     if s.endswith("USDT"):
         return s[:-4]
     return s
+
+
+# ══════════════════════════════════════════════════════════════
+# V7.9 FAST PREFILTER
+# ══════════════════════════════════════════════════════════════
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _prefilter_rank_key(item: dict) -> tuple[float, float, float]:
+    """Rank candidate theo biến động + volume. Ưu tiên coin đang có momentum thật."""
+    chg = abs(_safe_float(item.get("chg")))
+    qv = _safe_float(item.get("quote_volume"))
+    # log nhẹ để volume lớn không nuốt hết momentum
+    import math
+    vol_score = math.log10(max(qv, 1.0))
+    return (chg * 2.0 + vol_score, chg, qv)
+
+
+def get_fast_prefilter_symbols(exchange: str, symbols: list[str]) -> list[str]:
+    """
+    Lọc nhanh bằng 24h ticker trước khi chạy full scan.
+    Full scan mỗi symbol đang gọi nhiều endpoint: D/H12/H6/H4/M30 + OI + funding.
+    Prefilter giúp giảm request rất mạnh và tránh Binance 429.
+    """
+    if not FAST_PREFILTER_ENABLED or not symbols:
+        return symbols
+
+    symbol_set = set(symbols)
+    max_symbols = PREFILTER_MAX_SYMBOLS_BINANCE if exchange == "Binance" else PREFILTER_MAX_SYMBOLS_BYBIT
+
+    items: list[dict] = []
+
+    try:
+        if exchange == "Binance":
+            data = http_get_quick(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=12)
+            if isinstance(data, list):
+                for x in data:
+                    sym = x.get("symbol", "")
+                    if sym in symbol_set:
+                        items.append({
+                            "symbol": sym,
+                            "chg": _safe_float(x.get("priceChangePercent")),
+                            "quote_volume": _safe_float(x.get("quoteVolume")),
+                        })
+
+        elif exchange == "Bybit":
+            data = bybit_get("/v5/market/tickers", {"category": "linear"})
+            rows = data.get("list", []) if data else []
+            for x in rows:
+                sym = x.get("symbol", "")
+                if sym in symbol_set:
+                    # Bybit turnover24h ~ quote volume USDT
+                    items.append({
+                        "symbol": sym,
+                        "chg": _safe_float(x.get("price24hPcnt")) * 100.0,
+                        "quote_volume": _safe_float(x.get("turnover24h")),
+                    })
+
+        else:
+            return symbols
+
+    except Exception as e:
+        log.warning(f"{exchange} prefilter lỗi, fallback full symbols: {e}")
+        return symbols
+
+    if not items:
+        return symbols
+
+    gainers = sorted(items, key=lambda x: _safe_float(x.get("chg")), reverse=True)[:PREFILTER_TOP_GAINERS]
+    losers = sorted(items, key=lambda x: _safe_float(x.get("chg")))[:PREFILTER_TOP_LOSERS]
+    vol_top = sorted(items, key=lambda x: _safe_float(x.get("quote_volume")), reverse=True)[:PREFILTER_TOP_VOLUME]
+    movers = [x for x in items if abs(_safe_float(x.get("chg"))) >= PREFILTER_MIN_ABS_CHG]
+
+    picked: dict[str, dict] = {}
+    for group in (gainers, losers, vol_top, movers):
+        for x in group:
+            picked[x["symbol"]] = x
+
+    # Always keep watchlist nếu sàn có symbol đó.
+    for sym in symbols:
+        if normalize_symbol_base(sym) in PREFILTER_KEEP_ALWAYS:
+            picked.setdefault(sym, {"symbol": sym, "chg": 999, "quote_volume": 0})
+
+    selected = sorted(picked.values(), key=_prefilter_rank_key, reverse=True)[:max_symbols]
+    out = [x["symbol"] for x in selected]
+
+    log.info(
+        f"⚡ {exchange} prefilter: {len(symbols)} → {len(out)} symbols "
+        f"| movers>={PREFILTER_MIN_ABS_CHG}%={len(movers)}"
+    )
+    return out
 
 
 
@@ -3413,6 +3521,10 @@ def run_scan_exchange(exchange: str, skip_bases: set[str] | None = None) -> tupl
     if not symbols:
         log.warning(f"{exchange}: không còn symbol cần scan sau khi lọc trùng.")
         return [], [], []
+
+    # V7.9: lọc nhanh bằng 24h ticker trước khi gọi full scan nhiều endpoint.
+    # Giữ được các kèo kiểu EDEN vì nằm trong top gainer/volume/mover.
+    symbols = get_fast_prefilter_symbols(exchange, symbols)
 
     pump_results: list[ScoreResult] = []
     dump_results: list[ScoreResult] = []
