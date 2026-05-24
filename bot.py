@@ -121,8 +121,7 @@ DEADCAT_RETRACE_MIN = 0.382          # Entry zone short: hồi 38.2% nhịp dump
 DEADCAT_RETRACE_MAX = 0.618          # Entry zone short: hồi 61.8% nhịp dump
 
 # ── 1H Reversal Engine ────────────────────────────────────────
-ENABLE_1H_REVERSAL = True              # Bật/tắt lấy data 1H/M30 cho monitor/engine
-ENABLE_REVERSAL_ALERTS = False            # TẠM TẮT TOP REVERSAL: chỉ alert TOP PUMP/DUMP + monitor
+ENABLE_1H_REVERSAL = True              # Bật/tắt scan 1H reversal
 ENABLE_30MIN_SCAN = True               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
 DAILY_SCAN_HOUR   = 0                  # Giờ UTC chạy full scan 1D (0 = 00:02 UTC)
 # Pump Reversal: coin pump mạnh 1D nhưng 1H đang đảo chiều xuống
@@ -156,6 +155,16 @@ H1_BREAKOUT_MIN_VOL     = 3.0    # FIX: giảm từ 5x xuống 3x để không m
 H1_BREAKOUT_MIN_SCORE   = 3.0    # FIX: giảm score để alert H1 breakout sớm hơn
 H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 
+# ── Intraday Early Detection — bắt pump đang hình thành trong nến D ────────
+# Mục tiêu: alert sớm khi coin đang pump mạnh TRONG ngày, không cần đợi nến D đóng.
+# Trigger khi nến 1D live đã tăng >= ngưỡng từ open, vol đủ mạnh, FR âm.
+ENABLE_INTRADAY_EARLY   = True
+INTRADAY_EARLY_MIN_CHG  = 15.0   # Nến D đang tăng >= 15% từ open
+INTRADAY_EARLY_MIN_VOL  = 3.0    # Vol hiện tại >= 3x MA10 vol ngày
+INTRADAY_EARLY_FR_DEEP  = -0.15  # FR âm <= -0.15% → squeeze fuel bonus
+INTRADAY_EARLY_OI_MIN   = 15.0   # OI tăng >= 15% → xác nhận dòng tiền thật
+INTRADAY_EARLY_MIN_SCORE = 3.0   # Score tối thiểu để lọt list
+
 # Engine mode
 TREND_MIN_SCORE = 5.0                   # Ngưỡng nhận diện TREND coin kiểu IRYS
 SQUEEZE_MIN_SCORE = 5.0                 # Ngưỡng nhận diện SQUEEZE coin kiểu COS
@@ -174,27 +183,15 @@ VIOLENT_SQ_SCORE_BONUS = 3.2
 
 # Tăng tốc scan
 FAST_SCAN = True
-MAX_WORKERS_BINANCE = 7    # V7.9: tăng vừa phải vì đã có prefilter, vẫn tránh 429
-MAX_WORKERS_BYBIT  = 8    # V7.9: Bybit chỉ scan coin chưa có trên Binance + prefilter
+MAX_WORKERS_BINANCE = 12   # Giữ — Binance weight-based, 12 là sweet spot
+MAX_WORKERS_BYBIT  = 15   # Bybit limit 120 req/s, còn dư nhiều
 MAX_WORKERS_BINGX  = 6    # BingX limit 10 req/s thực tế
 MAX_WORKERS_KUCOIN = 5    # 5 workers + delay 80ms → ~10-12 req/s, safe với 30 req/min thực tế
 KUCOIN_REQUEST_DELAY = 0.08  # 80ms delay giữa các request → ~12 req/s max
 
 # Số workers tối đa cho parallel exchange scan (3 sàn chạy đồng thời)
-MAX_WORKERS_EXCHANGES = 1  # Scan tuần tự để tránh rate-limit và skip coin trùng Binance→Bybit
+MAX_WORKERS_EXCHANGES = 2  # Chạy Binance + Bybit song song
 LOG_EVERY_N = 25           # Log tiến độ mỗi N coin thay vì in từng coin
-
-# ── V7.9 Speed Prefilter ──────────────────────────────────────
-# Quét nhanh 24h ticker trước, chỉ full-score các coin đang thật sự có biến động.
-# Mục tiêu: giảm thời gian từ ~6 phút xuống khoảng 1-2 phút và vẫn bắt EDEN/BLUAI/violent moves.
-FAST_PREFILTER_ENABLED = True
-PREFILTER_MIN_ABS_CHG = 3.5              # vẫn giữ coin mới bắt đầu chạy/sập
-PREFILTER_MAX_SYMBOLS_BINANCE = 140      # Binance top candidates để full scan
-PREFILTER_MAX_SYMBOLS_BYBIT = 90         # Bybit chỉ phần không trùng Binance
-PREFILTER_TOP_GAINERS = 70
-PREFILTER_TOP_LOSERS = 70
-PREFILTER_TOP_VOLUME = 45
-PREFILTER_KEEP_ALWAYS = {"EDEN", "BLUAI", "RONIN", "CGPT"}  # watchlist luôn giữ nếu có symbol
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -252,7 +249,8 @@ class CoinData:
     # Open Interest
     oi_current: float = 0
     oi_prev4: float = 0
-    oi_change_pct: float = 0
+    oi_change_pct: float = 0       # OI thay đổi so với 4 nến trước (trend dài)
+    oi_spike_pct: float = 0        # OI thay đổi so với nến LIỀN TRƯỚC (đột biến ngắn hạn)
     # Funding Rate
     funding_rate: float = 0
     # Long/Short Ratio
@@ -485,115 +483,6 @@ def get_all_symbols(exchange: str) -> list[str]:
     if exchange == "KuCoin":
         return get_kucoin_symbols()
     raise ValueError(f"Unsupported exchange: {exchange}")
-
-
-def normalize_symbol_base(symbol: str) -> str:
-    """Chuẩn hóa symbol để tránh scan trùng giữa Binance/Bybit/KuCoin.
-    Ví dụ: EDENUSDT, EDENUSDTM → EDEN.
-    """
-    s = (symbol or "").upper().replace("-", "")
-    if s.endswith("USDTM"):
-        return s[:-5]
-    if s.endswith("USDT"):
-        return s[:-4]
-    return s
-
-
-# ══════════════════════════════════════════════════════════════
-# V7.9 FAST PREFILTER
-# ══════════════════════════════════════════════════════════════
-
-def _safe_float(x, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _prefilter_rank_key(item: dict) -> tuple[float, float, float]:
-    """Rank candidate theo biến động + volume. Ưu tiên coin đang có momentum thật."""
-    chg = abs(_safe_float(item.get("chg")))
-    qv = _safe_float(item.get("quote_volume"))
-    # log nhẹ để volume lớn không nuốt hết momentum
-    import math
-    vol_score = math.log10(max(qv, 1.0))
-    return (chg * 2.0 + vol_score, chg, qv)
-
-
-def get_fast_prefilter_symbols(exchange: str, symbols: list[str]) -> list[str]:
-    """
-    Lọc nhanh bằng 24h ticker trước khi chạy full scan.
-    Full scan mỗi symbol đang gọi nhiều endpoint: D/H12/H6/H4/M30 + OI + funding.
-    Prefilter giúp giảm request rất mạnh và tránh Binance 429.
-    """
-    if not FAST_PREFILTER_ENABLED or not symbols:
-        return symbols
-
-    symbol_set = set(symbols)
-    max_symbols = PREFILTER_MAX_SYMBOLS_BINANCE if exchange == "Binance" else PREFILTER_MAX_SYMBOLS_BYBIT
-
-    items: list[dict] = []
-
-    try:
-        if exchange == "Binance":
-            data = http_get_quick(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=12)
-            if isinstance(data, list):
-                for x in data:
-                    sym = x.get("symbol", "")
-                    if sym in symbol_set:
-                        items.append({
-                            "symbol": sym,
-                            "chg": _safe_float(x.get("priceChangePercent")),
-                            "quote_volume": _safe_float(x.get("quoteVolume")),
-                        })
-
-        elif exchange == "Bybit":
-            data = bybit_get("/v5/market/tickers", {"category": "linear"})
-            rows = data.get("list", []) if data else []
-            for x in rows:
-                sym = x.get("symbol", "")
-                if sym in symbol_set:
-                    # Bybit turnover24h ~ quote volume USDT
-                    items.append({
-                        "symbol": sym,
-                        "chg": _safe_float(x.get("price24hPcnt")) * 100.0,
-                        "quote_volume": _safe_float(x.get("turnover24h")),
-                    })
-
-        else:
-            return symbols
-
-    except Exception as e:
-        log.warning(f"{exchange} prefilter lỗi, fallback full symbols: {e}")
-        return symbols
-
-    if not items:
-        return symbols
-
-    gainers = sorted(items, key=lambda x: _safe_float(x.get("chg")), reverse=True)[:PREFILTER_TOP_GAINERS]
-    losers = sorted(items, key=lambda x: _safe_float(x.get("chg")))[:PREFILTER_TOP_LOSERS]
-    vol_top = sorted(items, key=lambda x: _safe_float(x.get("quote_volume")), reverse=True)[:PREFILTER_TOP_VOLUME]
-    movers = [x for x in items if abs(_safe_float(x.get("chg"))) >= PREFILTER_MIN_ABS_CHG]
-
-    picked: dict[str, dict] = {}
-    for group in (gainers, losers, vol_top, movers):
-        for x in group:
-            picked[x["symbol"]] = x
-
-    # Always keep watchlist nếu sàn có symbol đó.
-    for sym in symbols:
-        if normalize_symbol_base(sym) in PREFILTER_KEEP_ALWAYS:
-            picked.setdefault(sym, {"symbol": sym, "chg": 999, "quote_volume": 0})
-
-    selected = sorted(picked.values(), key=_prefilter_rank_key, reverse=True)[:max_symbols]
-    out = [x["symbol"] for x in selected]
-
-    log.info(
-        f"⚡ {exchange} prefilter: {len(symbols)} → {len(out)} symbols "
-        f"| movers>={PREFILTER_MIN_ABS_CHG}%={len(movers)}"
-    )
-    return out
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1252,9 +1141,14 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
     oi_hist = get_oi_history(exchange, symbol, limit=6)
     if oi_hist and len(oi_hist) >= 5:
         coin.oi_current = float(oi_hist[-1].get("openInterest", 0))
-        coin.oi_prev4 = float(oi_hist[-5].get("openInterest", 0))
+        coin.oi_prev4   = float(oi_hist[-5].get("openInterest", 0))
         if coin.oi_prev4 > 0:
             coin.oi_change_pct = (coin.oi_current - coin.oi_prev4) / coin.oi_prev4 * 100
+        # OI spike: so với nến liền trước (1 kỳ) — bắt đột biến ngắn hạn
+        if len(oi_hist) >= 2:
+            oi_prev1 = float(oi_hist[-2].get("openInterest", 0))
+            if oi_prev1 > 0:
+                coin.oi_spike_pct = (coin.oi_current - oi_prev1) / oi_prev1 * 100
     # Không sleep ở đây: bản FAST dùng ThreadPool + timeout ngắn
 
     lsr = get_lsr(exchange, symbol)
@@ -1487,10 +1381,13 @@ def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
         capped_sl = limit_entry * (1.0 - max_sl_pct)
         result.sl = fmt(max(raw_sl, capped_sl))
 
-        # TP từ entry limit; TP1 gần high cũ/retest, TP2/TP3 mở rộng.
-        result.tp1 = fmt(max(coin.high, limit_entry * 1.035))
-        result.tp2 = fmt(max(coin.high + d_range * 0.382, limit_entry * 1.065))
-        result.tp3 = fmt(max(coin.high + d_range * 0.618, limit_entry * 1.095))
+        # TP từ entry limit — TP xa hơn để bắt được toàn bộ sóng pump mạnh.
+        # TP1: retest high cũ hoặc +6% entry (trước: 3.5%)
+        # TP2: Fib 0.618 extension hoặc +12% entry (trước: 6.5%)
+        # TP3: Fib 1.0 extension hoặc +20% entry (trước: 9.5%)
+        result.tp1 = fmt(max(coin.high, limit_entry * 1.060))
+        result.tp2 = fmt(max(coin.high + d_range * 0.618, limit_entry * 1.120))
+        result.tp3 = fmt(max(coin.high + d_range * 1.000, limit_entry * 1.200))
 
         # Entry Now chỉ khi giá đã gần/đang trong zone, không phải đang treo cao hơn zone nhiều.
         dist_to_zone_high = (current - zone_high) / current * 100 if current > 0 else 999
@@ -1523,10 +1420,13 @@ def calc_pump_tp_sl(result: ScoreResult, coin: CoinData) -> None:
         capped_sl = limit_entry * (1.0 + max_sl_pct)
         result.sl = fmt(min(raw_sl, capped_sl))
 
-        # TP cho short từ entry limit; TP1 gần low cũ/retest.
-        result.tp1 = fmt(min(coin.low, limit_entry * 0.965))
-        result.tp2 = fmt(min(coin.low - d_range * 0.382, limit_entry * 0.935))
-        result.tp3 = fmt(min(coin.low - d_range * 0.618, limit_entry * 0.905))
+        # TP cho short từ entry limit — TP xa hơn để bắt được toàn bộ sóng dump.
+        # TP1: retest low cũ hoặc -6% entry (trước: 3.5%)
+        # TP2: Fib 0.618 extension hoặc -12% entry (trước: 6.5%)
+        # TP3: Fib 1.0 extension hoặc -20% entry (trước: 9.5%)
+        result.tp1 = fmt(min(coin.low, limit_entry * 0.940))
+        result.tp2 = fmt(min(coin.low - d_range * 0.618, limit_entry * 0.880))
+        result.tp3 = fmt(min(coin.low - d_range * 1.000, limit_entry * 0.800))
 
         # Entry Now chỉ khi giá đã hồi gần vùng short limit, không short đuổi đáy.
         dist_to_zone_low = (zone_low - current) / current * 100 if current > 0 else 999
@@ -1648,6 +1548,18 @@ def score_coin_pump(coin: CoinData) -> Optional[ScoreResult]:
     if is_violent_squeeze and coin.oi_change_pct >= VIOLENT_SQ_OI_MIN:
         result.score_oi_div = max(result.score_oi_div, 2.5 if coin.oi_change_pct < 50 else 3.5)
         details.append(f"⚡ OI squeeze spike (+{coin.oi_change_pct:.1f}%)")
+
+    # OI Spike ngắn hạn (1 kỳ) — đột biến Aggregated OI trong nến vừa đóng
+    # Bắt case như HANA: OI tăng 28% trong 1 nến = tiền mới vào cực mạnh
+    if coin.oi_spike_pct >= 30:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 2.0)
+        details.append(f"🚀 OI spike đột biến 1 nến: +{coin.oi_spike_pct:.1f}% — tiền mới vào cực mạnh")
+    elif coin.oi_spike_pct >= 20:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 1.5)
+        details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 12:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 0.8)
+        details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
 
     # 3. Funding Rate
     fr_pct = coin.funding_rate * 100
@@ -1835,7 +1747,16 @@ def score_coin_dump(coin: CoinData) -> Optional[ScoreResult]:
         result.score_oi_div = 1.0
         details.append(f"📡 OI giảm ({coin.oi_change_pct:.1f}%)")
 
-    # 3. Funding Rate cao dương = long trả phí = áp lực dump
+    # OI Spike ngắn hạn 1 kỳ — áp lực bán mới vào đột biến
+    if coin.oi_spike_pct >= 30:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 2.0)
+        details.append(f"🚀 OI spike 1 nến: +{coin.oi_spike_pct:.1f}% — short mới vào cực mạnh")
+    elif coin.oi_spike_pct >= 20:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 1.5)
+        details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 12:
+        result.score_oi_div = max(result.score_oi_div, result.score_oi_div + 0.8)
+        details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
     fr_pct = coin.funding_rate * 100
     if fr_pct >= 0.15:
         result.score_fr = 2.0
@@ -1979,33 +1900,32 @@ def calc_reversal_tp(result: ScoreResult, coin: CoinData) -> None:
         digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
         return round(v, digits)
 
-    # REVERSAL là scalp/ngắn hạn nên TP không kéo quá xa kiểu D1 extension.
-    # Dùng R-multiple cố định để tránh case TP3 xa bất thường (-30% đến -40%).
-    # TP1 ≈ 1R, TP2 ≈ 1.6R, TP3 ≈ 2.3R.
+    # R-multiple mở rộng hơn để bắt được sóng intraday đầy đủ.
+    # TP1 ≈ 1.5R, TP2 ≈ 2.5R, TP3 ≈ 4.0R (trước: 1R / 1.6R / 2.3R).
     if result.reversal_type == "DUMP_REVERSAL":
         sl = entry - h1_range * 0.3   # SL dưới đáy nến 1H 30% range
         risk = entry - sl
         if risk <= 0:
             return
-        tp1 = entry + risk * 1.0
-        tp2 = entry + risk * 1.6
-        tp3 = entry + risk * 2.3
+        tp1 = entry + risk * 1.5
+        tp2 = entry + risk * 2.5
+        tp3 = entry + risk * 4.0
 
         result.sl  = fmt(sl)
         result.tp1 = fmt(tp1)
         result.tp2 = fmt(tp2)
         result.tp3 = fmt(tp3)
-        result.rr_tp1 = 1.0
-        result.rr_tp2 = 1.6
+        result.rr_tp1 = 1.5
+        result.rr_tp2 = 2.5
 
     else:  # PUMP_REVERSAL / H1_BREAKOUT_SHORT
         sl = entry + h1_range * 0.3   # SL trên đỉnh nến 1H 30% range
         risk = sl - entry
         if risk <= 0:
             return
-        tp1 = entry - risk * 1.0
-        tp2 = entry - risk * 1.6
-        tp3 = entry - risk * 2.3
+        tp1 = entry - risk * 1.5
+        tp2 = entry - risk * 2.5
+        tp3 = entry - risk * 4.0
 
         # Không cho TP âm đối với coin giá nhỏ.
         tp1 = max(tp1, entry * 0.01)
@@ -2016,8 +1936,8 @@ def calc_reversal_tp(result: ScoreResult, coin: CoinData) -> None:
         result.tp1 = fmt(tp1)
         result.tp2 = fmt(tp2)
         result.tp3 = fmt(tp3)
-        result.rr_tp1 = 1.0
-        result.rr_tp2 = 1.6
+        result.rr_tp1 = 1.5
+        result.rr_tp2 = 2.5
 
 
 def score_reversal(coin: CoinData) -> Optional[ScoreResult]:
@@ -2419,6 +2339,14 @@ def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
         elif coin.oi_change_pct <= -5:
             score += 1.0; details.append(f"📡 OI giảm ({coin.oi_change_pct:.1f}%) — short cover")
 
+        # OI spike 1 nến — tiền mới vào đột biến, xác nhận momentum cực mạnh
+        if coin.oi_spike_pct >= 25:
+            score += 2.0; details.append(f"🚀 OI spike 1 nến: +{coin.oi_spike_pct:.1f}% — tiền mới vào cực mạnh")
+        elif coin.oi_spike_pct >= 15:
+            score += 1.0; details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+        elif coin.oi_spike_pct >= 8:
+            score += 0.5; details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
+
         # Liq: shorts bị liq = fuel
         if coin.liq_ratio >= 3:
             score += 1.5; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x")
@@ -2475,6 +2403,14 @@ def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
             score += 1.5; details.append(f"📡 OI tăng ({coin.oi_change_pct:.1f}%) — short vào")
         elif coin.oi_change_pct >= 5:
             score += 0.5; details.append(f"📡 OI tăng nhẹ ({coin.oi_change_pct:.1f}%)")
+
+        # OI spike 1 nến — short mới vào đột biến
+        if coin.oi_spike_pct >= 25:
+            score += 2.0; details.append(f"🚀 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+        elif coin.oi_spike_pct >= 15:
+            score += 1.0; details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+        elif coin.oi_spike_pct >= 8:
+            score += 0.5; details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
 
         # Liq: longs bị liq = cascade
         if coin.liq_longs > 0:
@@ -2937,594 +2873,325 @@ def _smart_round(v: float) -> float:
     digits = max(2, -int(math.floor(math.log10(abs(v)))) + 4)
     return round(v, digits)
 
-
-# ============================================================
-# EARLY MTF ENGINE — BẮT LONG/SHORT SỚM SAU KHI ĐÓNG NẾN D
-# ============================================================
-
-EARLY_MTF_MIN_SCORE = 6.0
-
-
-def get_ohlcv_h4(exchange: str, symbol: str, limit: int = 12) -> Optional[list]:
-    return _get_ohlcv_interval(exchange, symbol, "4h", "240", "4h", 240, limit)
-
-
-def _body_pct(o, c):
-    return abs(c - o) / max(o, 1e-12) * 100
-
-
-def _upper_wick_ratio(o, h, l, c):
-    rng = h - l
-    return 0 if rng <= 0 else (h - max(o, c)) / rng
-
-
-def _lower_wick_ratio(o, h, l, c):
-    rng = h - l
-    return 0 if rng <= 0 else (min(o, c) - l) / rng
-
-
-def _calc_short_tp_sl_from_range(result: ScoreResult, entry: float, swing_high: float, swing_low: float):
-    result.entry = _smart_round(entry)
-    result.sl = _smart_round(swing_high * 1.012)
-    result.tp1 = _smart_round(entry - (entry - swing_low) * 0.55)
-    result.tp2 = _smart_round(swing_low)
-    result.tp3 = _smart_round(swing_low * 0.94)
-
-
-def _calc_long_tp_sl_from_range(result: ScoreResult, entry: float, swing_high: float, swing_low: float):
-    result.entry = _smart_round(entry)
-    result.sl = _smart_round(swing_low * 0.988)
-    result.tp1 = _smart_round(entry + (swing_high - entry) * 0.55)
-    result.tp2 = _smart_round(swing_high)
-    result.tp3 = _smart_round(swing_high * 1.06)
-
-
-def score_early_mtf_short(coin: CoinData) -> Optional[ScoreResult]:
-    """Bắt SHORT sớm: D1 exhaustion + H12 distribution + H4/M30 trigger."""
-    candles_d = get_ohlcv(coin.exchange, coin.symbol, limit=8)
-    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=6)
-    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=8)
-    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=10)
-
-    if not candles_d or len(candles_d) < 4 or not h12 or len(h12) < 3 or not h4 or len(h4) < 3:
-        return None
-
-    d_prev = candles_d[-2]      # nến D đã đóng gần nhất
-    d_now = candles_d[-1]       # nến D hiện tại / đầu ngày mới
-    po, ph, pl, pc = map(float, [d_prev["o"], d_prev["h"], d_prev["l"], d_prev["c"]])
-    no, nh, nl, nc = map(float, [d_now["o"], d_now["h"], d_now["l"], d_now["c"]])
-
-    h12_last = h12[-1]
-    h12_prev = h12[-2]
-    h4_last = h4[-1]
-    m30_last = m30[-1] if m30 else None
-
-    h12_o, h12_h, h12_l, h12_c = map(float, [h12_last["o"], h12_last["h"], h12_last["l"], h12_last["c"]])
-    h12_prev_h = float(h12_prev["h"])
-    h4_o, h4_h, h4_l, h4_c = map(float, [h4_last["o"], h4_last["h"], h4_last["l"], h4_last["c"]])
-
-    score = 0.0
-    details = []
-
-    prev_chg = (pc - po) / max(po, 1e-12) * 100
-    now_chg = (nc - no) / max(no, 1e-12) * 100
-    fr_pct = coin.funding_rate * 100
-
-    # D1 context: pump mạnh hôm qua nhưng có dấu hiệu exhaustion/distribution.
-    if prev_chg >= 12:
-        score += 1.5
-        details.append(f"D1 pump hôm qua +{prev_chg:.1f}%")
-    if _upper_wick_ratio(po, ph, pl, pc) >= 0.35:
-        score += 1.5
-        details.append("D1 râu trên/exhaustion")
-    if fr_pct >= 0.02:
-        score += 1.0
-        details.append(f"Funding dương/crowded {fr_pct:.4f}%")
-    if coin.oi_change_pct >= 15 and now_chg <= 1:
-        score += 1.5
-        details.append(f"OI cao nhưng giá yếu ({coin.oi_change_pct:.1f}%)")
-
-    # H12 distribution.
-    if h12_h < h12_prev_h and h12_c < h12_o:
-        score += 2.0
-        details.append("H12 lower high + nến đỏ")
-    if h12_c < (h12_l + (h12_h - h12_l) * 0.45):
-        score += 1.0
-        details.append("H12 đóng yếu dưới mid-range")
-
-    # H4 breakdown trigger.
-    if h4_c < h4_o and h4_c < h12_l:
-        score += 2.0
-        details.append("H4 breakdown dưới H12 low")
-    elif h4_c < h4_o:
-        score += 1.0
-        details.append("H4 bắt đầu đỏ")
-
-    # M30 timing.
-    if m30_last:
-        m30_o, m30_c = float(m30_last["o"]), float(m30_last["c"])
-        if m30_c < m30_o:
-            score += 0.8
-            details.append("M30 confirm đỏ")
-
-    if score < EARLY_MTF_MIN_SCORE:
-        return None
-
-    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    r.total_score = round(score, 1)
-    r.signal_type = "🔻 EARLY MTF SHORT"
-    r.market_mode = "EARLY_DISTRIBUTION_SHORT"
-    r.reversal_type = "EARLY_MTF_SHORT"
-    r.timeframe = "MTF"
-    r.price_chg = round(now_chg, 2)
-    r.price_current = round(nc, 8)
-    r.fr = round(fr_pct, 4)
-    r.oi_chg_pct = round(coin.oi_change_pct, 1)
-    r.details = details
-
-    entry = nc
-    swing_high = max(ph, h12_h, h4_h)
-    swing_low = min(pl, h12_l, h4_l)
-    _calc_short_tp_sl_from_range(r, entry, swing_high, swing_low)
-    return r
-
-
-def score_early_mtf_long(coin: CoinData) -> Optional[ScoreResult]:
-    """Bắt LONG sớm: D1 absorption + H12 accumulation + H4/M30 trigger."""
-    candles_d = get_ohlcv(coin.exchange, coin.symbol, limit=8)
-    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=6)
-    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=8)
-    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=10)
-
-    if not candles_d or len(candles_d) < 4 or not h12 or len(h12) < 3 or not h4 or len(h4) < 3:
-        return None
-
-    d_prev = candles_d[-2]
-    d_now = candles_d[-1]
-    po, ph, pl, pc = map(float, [d_prev["o"], d_prev["h"], d_prev["l"], d_prev["c"]])
-    no, nh, nl, nc = map(float, [d_now["o"], d_now["h"], d_now["l"], d_now["c"]])
-
-    h12_last = h12[-1]
-    h12_prev = h12[-2]
-    h4_last = h4[-1]
-    m30_last = m30[-1] if m30 else None
-
-    h12_o, h12_h, h12_l, h12_c = map(float, [h12_last["o"], h12_last["h"], h12_last["l"], h12_last["c"]])
-    h12_prev_l = float(h12_prev["l"])
-    h4_o, h4_h, h4_l, h4_c = map(float, [h4_last["o"], h4_last["h"], h4_last["l"], h4_last["c"]])
-
-    score = 0.0
-    details = []
-
-    prev_chg = (pc - po) / max(po, 1e-12) * 100
-    now_chg = (nc - no) / max(no, 1e-12) * 100
-    fr_pct = coin.funding_rate * 100
-
-    # D1 context: dump mạnh hôm qua nhưng có absorption.
-    if prev_chg <= -10:
-        score += 1.5
-        details.append(f"D1 dump hôm qua {prev_chg:.1f}%")
-    if _lower_wick_ratio(po, ph, pl, pc) >= 0.35:
-        score += 1.5
-        details.append("D1 râu dưới/absorption")
-    if fr_pct <= -0.05:
-        score += 1.2
-        details.append(f"Funding âm sâu {fr_pct:.4f}%")
-    if coin.oi_change_pct >= 15 and now_chg >= -1:
-        score += 1.3
-        details.append(f"OI cao nhưng giá không giảm tiếp ({coin.oi_change_pct:.1f}%)")
-
-    # H12 accumulation / reclaim.
-    if h12_l > h12_prev_l and h12_c > h12_o:
-        score += 2.0
-        details.append("H12 higher low + nến xanh")
-    if h12_c > (h12_l + (h12_h - h12_l) * 0.55):
-        score += 1.0
-        details.append("H12 đóng khỏe trên mid-range")
-
-    # H4 breakout trigger.
-    if h4_c > h4_o and h4_c > h12_h:
-        score += 2.0
-        details.append("H4 breakout trên H12 high")
-    elif h4_c > h4_o:
-        score += 1.0
-        details.append("H4 bắt đầu xanh")
-
-    # M30 timing.
-    if m30_last:
-        m30_o, m30_c = float(m30_last["o"]), float(m30_last["c"])
-        if m30_c > m30_o:
-            score += 0.8
-            details.append("M30 confirm xanh")
-
-    if score < EARLY_MTF_MIN_SCORE:
-        return None
-
-    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    r.total_score = round(score, 1)
-    r.signal_type = "🚀 EARLY MTF LONG"
-    r.market_mode = "EARLY_ACCUMULATION_LONG"
-    r.reversal_type = "EARLY_MTF_LONG"
-    r.timeframe = "MTF"
-    r.price_chg = round(now_chg, 2)
-    r.price_current = round(nc, 8)
-    r.fr = round(fr_pct, 4)
-    r.oi_chg_pct = round(coin.oi_change_pct, 1)
-    r.details = details
-
-    entry = nc
-    swing_high = max(ph, h12_h, h4_h)
-    swing_low = min(pl, h12_l, h4_l)
-    _calc_long_tp_sl_from_range(r, entry, swing_high, swing_low)
-    return r
-
-
-# ============================================================
-# EDEN / VIOLENT CONTINUATION MTF ENGINE
-# Bắt kèo LONG/SHORT sớm ngay trong cây H12/H6/H4, trước khi D1 pump/dump xong.
-# Mục tiêu: bắt pattern như EDEN ngày 17/5: base dài → H12 expansion → OI tăng → funding chưa quá crowded.
-# ============================================================
-
-EDEN_MTF_MIN_SCORE = 7.0
-EDEN_MTF_FORCE_TOP_SCORE = 9.8
-
-
-def _safe_pct_change(o: float, c: float) -> float:
-    return (c - o) / max(o, 1e-12) * 100.0
-
-
-def _avg_volume(candles: list, n: int = 6, offset_last: int = 1) -> float:
-    """MA volume của n nến trước nến cuối. offset_last=1 nghĩa là bỏ nến đang xét."""
-    if not candles or len(candles) <= n:
-        return 0.0
-    end = -offset_last if offset_last > 0 else None
-    vals = [float(x.get('v', 0) or 0) for x in candles[-(n + offset_last):end]]
-    return sum(vals) / len(vals) if vals else 0.0
-
-
-def _range_position(low: float, high: float, close: float) -> float:
-    rng = high - low
-    if rng <= 0:
-        return 0.5
-    return (close - low) / rng
-
-
-def _calc_violent_long_tp_sl(result: ScoreResult, entry: float, recent_low: float, strength_score: float) -> None:
-    """TP xa cho violent continuation: dùng extension theo % thay vì TP ngắn kiểu scalp."""
-    entry = max(entry, 1e-12)
-    # SL không quá xa: dưới low H12/H4 gần nhất một chút.
-    sl = recent_low * 0.985 if recent_low > 0 else entry * 0.90
-
-    if strength_score >= 9.0:
-        m1, m2, m3 = 1.28, 1.62, 2.10
-    elif strength_score >= 8.0:
-        m1, m2, m3 = 1.20, 1.45, 1.80
-    else:
-        m1, m2, m3 = 1.14, 1.30, 1.55
-
-    result.entry = _smart_round(entry)
-    result.entry_zone_high = _smart_round(entry * 0.992)   # hồi nông 0.8%
-    result.entry_zone_low = _smart_round(entry * 0.974)    # hồi tối đa 2.6%
-    result.sl = _smart_round(sl)
-    result.tp1 = _smart_round(entry * m1)
-    result.tp2 = _smart_round(entry * m2)
-    result.tp3 = _smart_round(entry * m3)
-    result.entry_now_allowed = False
-    result.entry_note = 'VIOLENT MTF: chờ hồi nông 0.8–2.6%, TP dùng extension xa'
-
-
-def _calc_violent_short_tp_sl(result: ScoreResult, entry: float, recent_high: float, strength_score: float) -> None:
-    entry = max(entry, 1e-12)
-    sl = recent_high * 1.015 if recent_high > 0 else entry * 1.10
-
-    if strength_score >= 9.0:
-        m1, m2, m3 = 0.78, 0.62, 0.45
-    elif strength_score >= 8.0:
-        m1, m2, m3 = 0.84, 0.70, 0.55
-    else:
-        m1, m2, m3 = 0.88, 0.76, 0.62
-
-    result.entry = _smart_round(entry)
-    result.entry_zone_low = _smart_round(entry * 1.008)    # hồi nông 0.8%
-    result.entry_zone_high = _smart_round(entry * 1.026)   # hồi tối đa 2.6%
-    result.sl = _smart_round(sl)
-    result.tp1 = _smart_round(entry * m1)
-    result.tp2 = _smart_round(entry * m2)
-    result.tp3 = _smart_round(entry * m3)
-    result.entry_now_allowed = False
-    result.entry_note = 'VIOLENT MTF SHORT: chờ hồi nông 0.8–2.6%, TP dùng extension xa'
-
-
-def score_eden_mtf_long(coin: CoinData) -> Optional[ScoreResult]:
-    """LONG continuation sớm: H12/H6/H4 expansion + OI + funding chưa quá crowded.
-
-    Bắt các case giống EDEN: chưa cần chờ D1 đóng, chỉ cần H12/H6 xác nhận breakout.
-    """
-    d = get_ohlcv(coin.exchange, coin.symbol, limit=25)
-    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=8)
-    h6 = get_ohlcv_h6(coin.exchange, coin.symbol, limit=10)
-    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=12)
-    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=12)
-    if not d or len(d) < 12 or not h12 or len(h12) < 4 or not h6 or len(h6) < 4 or not h4 or len(h4) < 4:
-        return None
-
-    d_now = d[-1]
-    d_prev_highs = [float(x.get('h', 0) or 0) for x in d[-21:-1]]
-    d20_high = max(d_prev_highs) if d_prev_highs else 0.0
-
-    h12_last, h12_prev = h12[-1], h12[-2]
-    h6_last = h6[-1]
-    h4_last = h4[-1]
-    m30_last = m30[-1] if m30 else None
-
-    h12_o, h12_h, h12_l, h12_c, h12_v = map(float, [h12_last['o'], h12_last['h'], h12_last['l'], h12_last['c'], h12_last['v']])
-    h6_o, h6_h, h6_l, h6_c, h6_v = map(float, [h6_last['o'], h6_last['h'], h6_last['l'], h6_last['c'], h6_last['v']])
-    h4_o, h4_h, h4_l, h4_c, h4_v = map(float, [h4_last['o'], h4_last['h'], h4_last['l'], h4_last['c'], h4_last['v']])
-
-    h12_chg = _safe_pct_change(h12_o, h12_c)
-    h6_chg = _safe_pct_change(h6_o, h6_c)
-    h4_chg = _safe_pct_change(h4_o, h4_c)
-    d_chg = _safe_pct_change(float(d_now['o']), float(d_now['c']))
-    h12_vr = h12_v / max(_avg_volume(h12, 5, 1), 1e-12)
-    h6_vr = h6_v / max(_avg_volume(h6, 6, 1), 1e-12)
-    h4_vr = h4_v / max(_avg_volume(h4, 8, 1), 1e-12)
-    fr_pct = coin.funding_rate * 100.0
-
-    score = 0.0
-    details = []
-
-    # Break base / D1 range expansion.
-    if d20_high > 0 and float(d_now['c']) > d20_high * 1.01:
-        score += 2.0
-        details.append('D1 break 20D high/base dài')
-    elif d_chg >= 10:
-        score += 1.2
-        details.append(f'D1 đang expand +{d_chg:.1f}%')
-
-    # H12 là trigger chính để bắt như EDEN.
-    if h12_chg >= 12 and h12_vr >= 2.0:
-        score += 3.0
-        details.append(f'H12 expansion +{h12_chg:.1f}% vol {h12_vr:.1f}x')
-    elif h12_chg >= 8:
-        score += 2.2
-        details.append(f'H12 breakout sớm +{h12_chg:.1f}%')
-
-    if _range_position(h12_l, h12_h, h12_c) >= 0.62:
-        score += 1.0
-        details.append('H12 đóng khỏe trên 62% range')
-
-    # H6/H4 xác nhận continuation.
-    if h6_chg >= 8 and h6_vr >= 1.5:
-        score += 1.8
-        details.append(f'H6 tiếp diễn +{h6_chg:.1f}% vol {h6_vr:.1f}x')
-    elif h6_chg >= 5:
-        score += 1.0
-        details.append(f'H6 xanh +{h6_chg:.1f}%')
-
-    if h4_chg >= 5 and h4_c > max(float(h4[-2]['h']), float(h4[-3]['h'])):
-        score += 1.5
-        details.append(f'H4 break cấu trúc +{h4_chg:.1f}%')
-    elif h4_chg > 0:
-        score += 0.6
-        details.append('H4 còn xanh')
-
-    # OI + funding: EDEN thường OI tăng mạnh nhưng funding chưa dương quá crowded.
-    if coin.oi_change_pct >= 40:
-        score += 2.0
-        details.append(f'OI spike mạnh +{coin.oi_change_pct:.1f}%')
-    elif coin.oi_change_pct >= 20:
-        score += 1.2
-        details.append(f'OI tăng +{coin.oi_change_pct:.1f}%')
-
-    if fr_pct <= 0.03:
-        score += 1.2
-        details.append(f'Funding chưa crowded {fr_pct:.4f}%')
-    elif fr_pct <= 0.08:
-        score += 0.4
-        details.append(f'Funding hơi nóng nhưng còn dùng được {fr_pct:.4f}%')
-    else:
-        score -= 1.0
-        details.append(f'Funding quá dương/crowded {fr_pct:.4f}%')
-
-    if m30_last:
-        m30_o, m30_c = float(m30_last['o']), float(m30_last['c'])
-        if m30_c >= m30_o:
-            score += 0.5
-            details.append('M30 giữ xanh/higher low')
-
-    if score < EDEN_MTF_MIN_SCORE:
-        return None
-
-    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    r.total_score = round(max(score, EDEN_MTF_FORCE_TOP_SCORE if score >= 9.0 else score), 1)
-    r.signal_type = '🔥 EDEN MTF CONTINUATION LONG'
-    r.market_mode = 'SQUEEZE'
-    r.reversal_type = ''
-    r.timeframe = 'MTF-H12'
-    r.price_chg = round(d_chg, 2)
-    r.h1_chg = round(h4_chg, 2)
-    r.m30_chg = round(_safe_pct_change(float(m30_last['o']), float(m30_last['c'])), 2) if m30_last else 0
-    r.price_current = round(h12_c, 8)
-    r.fr = round(fr_pct, 4)
-    r.oi_chg_pct = round(coin.oi_change_pct, 1)
-    r.vol_ratio = round(max(h12_vr, h6_vr, h4_vr), 2)
-    r.squeeze_engine_score = round(score, 1)
-    r.details = details
-    _calc_violent_long_tp_sl(r, h12_c, min(h12_l, h6_l, h4_l), score)
-    return r
-
-
-def score_eden_mtf_short(coin: CoinData) -> Optional[ScoreResult]:
-    """SHORT continuation sớm: ngược lại với EDEN LONG — H12/H6 breakdown + OI + funding không còn hỗ trợ."""
-    d = get_ohlcv(coin.exchange, coin.symbol, limit=25)
-    h12 = get_ohlcv_h12(coin.exchange, coin.symbol, limit=8)
-    h6 = get_ohlcv_h6(coin.exchange, coin.symbol, limit=10)
-    h4 = get_ohlcv_h4(coin.exchange, coin.symbol, limit=12)
-    m30 = get_ohlcv_m30(coin.exchange, coin.symbol, limit=12)
-    if not d or len(d) < 12 or not h12 or len(h12) < 4 or not h6 or len(h6) < 4 or not h4 or len(h4) < 4:
-        return None
-
-    d_now = d[-1]
-    d_prev_lows = [float(x.get('l', 0) or 0) for x in d[-21:-1]]
-    d20_low = min([x for x in d_prev_lows if x > 0], default=0.0)
-    h12_last = h12[-1]
-    h6_last = h6[-1]
-    h4_last = h4[-1]
-    m30_last = m30[-1] if m30 else None
-
-    h12_o, h12_h, h12_l, h12_c, h12_v = map(float, [h12_last['o'], h12_last['h'], h12_last['l'], h12_last['c'], h12_last['v']])
-    h6_o, h6_h, h6_l, h6_c, h6_v = map(float, [h6_last['o'], h6_last['h'], h6_last['l'], h6_last['c'], h6_last['v']])
-    h4_o, h4_h, h4_l, h4_c, h4_v = map(float, [h4_last['o'], h4_last['h'], h4_last['l'], h4_last['c'], h4_last['v']])
-
-    h12_chg = _safe_pct_change(h12_o, h12_c)
-    h6_chg = _safe_pct_change(h6_o, h6_c)
-    h4_chg = _safe_pct_change(h4_o, h4_c)
-    d_chg = _safe_pct_change(float(d_now['o']), float(d_now['c']))
-    h12_vr = h12_v / max(_avg_volume(h12, 5, 1), 1e-12)
-    h6_vr = h6_v / max(_avg_volume(h6, 6, 1), 1e-12)
-    h4_vr = h4_v / max(_avg_volume(h4, 8, 1), 1e-12)
-    fr_pct = coin.funding_rate * 100.0
-
-    score = 0.0
-    details = []
-
-    if d20_low > 0 and float(d_now['c']) < d20_low * 0.99:
-        score += 2.0
-        details.append('D1 breakdown 20D low/base dài')
-    elif d_chg <= -8:
-        score += 1.2
-        details.append(f'D1 đang dump {d_chg:.1f}%')
-
-    if h12_chg <= -10 and h12_vr >= 1.5:
-        score += 3.0
-        details.append(f'H12 breakdown {h12_chg:.1f}% vol {h12_vr:.1f}x')
-    elif h12_chg <= -6:
-        score += 2.0
-        details.append(f'H12 breakdown sớm {h12_chg:.1f}%')
-
-    if _range_position(h12_l, h12_h, h12_c) <= 0.38:
-        score += 1.0
-        details.append('H12 đóng yếu dưới 38% range')
-
-    if h6_chg <= -6 and h6_vr >= 1.3:
-        score += 1.6
-        details.append(f'H6 tiếp diễn {h6_chg:.1f}% vol {h6_vr:.1f}x')
-    elif h6_chg < 0:
-        score += 0.8
-        details.append('H6 đỏ')
-
-    if h4_chg <= -4 and h4_c < min(float(h4[-2]['l']), float(h4[-3]['l'])):
-        score += 1.5
-        details.append(f'H4 breakdown cấu trúc {h4_chg:.1f}%')
-    elif h4_chg < 0:
-        score += 0.6
-        details.append('H4 còn đỏ')
-
-    if coin.oi_change_pct >= 25:
-        score += 1.2
-        details.append(f'OI tăng trong nhịp dump +{coin.oi_change_pct:.1f}%')
-
-    if fr_pct >= -0.05:
-        score += 1.0
-        details.append(f'Funding chưa quá âm {fr_pct:.4f}%')
-    else:
-        score -= 0.8
-        details.append(f'Funding quá âm, dễ short squeeze {fr_pct:.4f}%')
-
-    if m30_last:
-        m30_o, m30_c = float(m30_last['o']), float(m30_last['c'])
-        if m30_c <= m30_o:
-            score += 0.5
-            details.append('M30 giữ đỏ/lower high')
-
-    if score < EDEN_MTF_MIN_SCORE:
-        return None
-
-    r = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    r.total_score = round(max(score, EDEN_MTF_FORCE_TOP_SCORE if score >= 9.0 else score), 1)
-    r.signal_type = '💀 MTF CONTINUATION SHORT'
-    r.market_mode = 'DUMP_CONTINUATION'
-    r.reversal_type = ''
-    r.timeframe = 'MTF-H12'
-    r.price_chg = round(d_chg, 2)
-    r.h1_chg = round(h4_chg, 2)
-    r.m30_chg = round(_safe_pct_change(float(m30_last['o']), float(m30_last['c'])), 2) if m30_last else 0
-    r.price_current = round(h12_c, 8)
-    r.fr = round(fr_pct, 4)
-    r.oi_chg_pct = round(coin.oi_change_pct, 1)
-    r.vol_ratio = round(max(h12_vr, h6_vr, h4_vr), 2)
-    r.squeeze_engine_score = round(score, 1)
-    r.details = details
-    _calc_violent_short_tp_sl(r, h12_c, max(h12_h, h6_h, h4_h), score)
-    return r
-
-
 def scan_one_symbol(exchange: str, symbol: str) -> tuple[
     Optional[ScoreResult], Optional[ScoreResult], Optional[ScoreResult]
 ]:
-    """Scan 1 coin. V7.7: chỉ trả PUMP/DUMP; tạm tắt TOP REVERSAL để alert gọn hơn."""
+    """Scan 1 coin. Trả về (pump_result, dump_result, reversal_result)."""
     coin = fetch_coin_data(exchange, symbol)
     if coin is None:
         return None, None, None
-
     pump = score_coin_pump(coin)
     dump = score_coin_dump(coin)
-
-    # SHORT distribution cũ.
     dist = score_distribution_short(coin)
     if dist and (dump is None or dist.total_score >= dump.total_score):
         dump = dist
-
-    # EARLY MTF cũ: bắt sau D close / đầu D mới.
-    early_short = score_early_mtf_short(coin)
-    if early_short and (dump is None or early_short.total_score >= dump.total_score):
-        dump = early_short
-
-    early_long = score_early_mtf_long(coin)
-    if early_long and (pump is None or early_long.total_score >= pump.total_score):
-        pump = early_long
-
-    # EDEN engine mới: bắt violent continuation ngay trong H12/H6/H4.
-    eden_long = score_eden_mtf_long(coin)
-    if eden_long and (pump is None or eden_long.total_score >= pump.total_score):
-        pump = eden_long
-
-    eden_short = score_eden_mtf_short(coin)
-    if eden_short and (dump is None or eden_short.total_score >= dump.total_score):
-        dump = eden_short
-
-    # Tạm thời bỏ TOP REVERSAL theo yêu cầu.
-    reversal = None
-    if ENABLE_REVERSAL_ALERTS:
-        rev1 = score_reversal(coin)
-        rev2 = score_h1_breakout(coin)
-        if rev1 and rev2:
-            reversal = rev1 if rev1.total_score >= rev2.total_score else rev2
-        else:
-            reversal = rev1 or rev2
-
+    # Lấy signal tốt nhất: reversal hoặc h1_breakout
+    rev1 = score_reversal(coin)
+    rev2 = score_h1_breakout(coin)
+    if rev1 and rev2:
+        reversal = rev1 if rev1.total_score >= rev2.total_score else rev2
+    else:
+        reversal = rev1 or rev2
     return pump, dump, reversal
 
-def run_scan_exchange(exchange: str, skip_bases: set[str] | None = None) -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
+
+def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
+    """
+    Intraday Early Detection — bắt pump đang hình thành trong nến D LIVE.
+
+    Không cần đợi nến D đóng. Trigger khi:
+      • Nến D live đã tăng >= INTRADAY_EARLY_MIN_CHG% từ open
+      • Vol >= INTRADAY_EARLY_MIN_VOL x MA10
+      • Bonus: FR âm sâu, OI tăng mạnh, H1 cùng chiều
+    """
+    if not ENABLE_INTRADAY_EARLY:
+        return None
+    if coin.open <= 0 or coin.vol_ma10 <= 0:
+        return None
+
+    # Tính % tăng từ open đến close hiện tại (live candle)
+    intraday_chg = (coin.close - coin.open) / coin.open * 100 if coin.open > 0 else 0
+    vol_ratio    = coin.volume / coin.vol_ma10 if coin.vol_ma10 > 0 else 0
+    fr_pct       = coin.funding_rate * 100
+
+    # Filter cứng — cần đủ cả chg lẫn vol để tránh noise
+    if intraday_chg < INTRADAY_EARLY_MIN_CHG:
+        return None
+    if vol_ratio < INTRADAY_EARLY_MIN_VOL:
+        return None
+
+    result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    result.timeframe     = "1D-LIVE"
+    result.reversal_type = "INTRADAY_EARLY_LONG"
+    result.vol_ratio     = round(vol_ratio, 2)
+    result.oi_chg_pct    = round(coin.oi_change_pct, 1)
+    result.fr            = round(fr_pct, 4)
+    result.lsr           = round(coin.lsr, 4)
+    result.price_current = round(coin.close, 8)
+    result.price_chg     = round(intraday_chg, 2)
+    result.day_low       = round(coin.low, 8)
+
+    score   = 0.0
+    details = []
+
+    details.append(f"⚡ Intraday Pump: open {coin.open:.6g} → now {coin.close:.6g} (+{intraday_chg:.1f}%)")
+
+    # Momentum intraday
+    if intraday_chg >= 40:
+        score += 3.0; details.append(f"🔥 Pump cực mạnh trong ngày (+{intraday_chg:.1f}%)")
+    elif intraday_chg >= 25:
+        score += 2.0; details.append(f"💪 Pump rất mạnh (+{intraday_chg:.1f}%)")
+    else:
+        score += 1.0; details.append(f"📈 Pump trong ngày (+{intraday_chg:.1f}%)")
+
+    # Vol spike — xác nhận dòng tiền thật
+    if vol_ratio >= 8:
+        score += 3.0; details.append(f"💥 Vol spike cực mạnh ({vol_ratio:.1f}x MA10)")
+    elif vol_ratio >= 5:
+        score += 2.0; details.append(f"💥 Vol spike mạnh ({vol_ratio:.1f}x MA10)")
+    else:
+        score += 1.0; details.append(f"📊 Vol tăng ({vol_ratio:.1f}x MA10)")
+
+    # Funding âm = squeeze fuel
+    if fr_pct <= -0.5:
+        score += 3.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%) — short squeeze mạnh")
+    elif fr_pct <= INTRADAY_EARLY_FR_DEEP:
+        score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%) — squeeze fuel")
+    elif fr_pct <= -0.05:
+        score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
+
+    # OI tăng = dòng tiền mới vào, không phải short cover thuần
+    if coin.oi_change_pct >= INTRADAY_EARLY_OI_MIN * 2:
+        score += 2.0; details.append(f"📡 OI tăng mạnh (+{coin.oi_change_pct:.1f}%) — long thật vào")
+    elif coin.oi_change_pct >= INTRADAY_EARLY_OI_MIN:
+        score += 1.0; details.append(f"📡 OI tăng ({coin.oi_change_pct:.1f}%)")
+
+    # OI spike 1 nến — đột biến Aggregated OI ngay trong nến đang chạy
+    # Case HANA: OI 10.6M → 13.6M (+28%) đúng lúc pump = tín hiệu mạnh nhất
+    if coin.oi_spike_pct >= 30:
+        score += 3.0; details.append(f"🚀 OI spike đột biến: +{coin.oi_spike_pct:.1f}% — tiền mới vào CỰC MẠNH")
+    elif coin.oi_spike_pct >= 20:
+        score += 2.0; details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 12:
+        score += 1.0; details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
+
+    # H1 cùng chiều = momentum vẫn đang chạy
+    if coin.h1_available and coin.h1_price_change_pct >= 3:
+        score += 1.5; details.append(f"✅ H1 xác nhận (+{coin.h1_price_change_pct:.1f}%) — pump đang tiếp diễn")
+    elif coin.h1_available and coin.h1_price_change_pct >= 1:
+        score += 0.5; details.append(f"➡️ H1 tích cực (+{coin.h1_price_change_pct:.1f}%)")
+
+    # Liq: shorts bị thanh lý = cascade up
+    if coin.liq_ratio >= 3:
+        score += 1.5; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x — cascade")
+    elif coin.liq_ratio >= 1.5:
+        score += 0.5; details.append(f"✅ Shorts liq {coin.liq_ratio:.1f}x")
+
+    result.total_score = round(score, 1)
+    result.details     = details
+
+    if result.total_score < INTRADAY_EARLY_MIN_SCORE:
+        return None
+
+    # Signal label
+    if score >= 10:
+        result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (MUA SỚM)"
+    elif score >= 7:
+        result.signal_type = "⚡🚀 INTRADAY PUMP — RẤT MẠNH"
+    elif score >= 5:
+        result.signal_type = "⚡📈 INTRADAY PUMP ĐANG HÌNH THÀNH"
+    else:
+        result.signal_type = "⚡ Intraday Pump Early Signal"
+
+    # TP/SL dựa trên range intraday + Fib extension
+    import math as _math
+    d_range   = coin.high - coin.low
+    entry     = coin.close  # entry now = giá hiện tại (không đuổi, dùng retest)
+    # Buy zone: chờ hồi 2–5% từ giá hiện tại
+    zone_high = entry * 0.980
+    zone_low  = entry * 0.955
+    limit_entry = (zone_high + zone_low) / 2
+
+    def _fmt_v(v: float) -> float:
+        if v == 0: return 0.0
+        digits = max(2, -int(_math.floor(_math.log10(abs(v)))) + 3)
+        return round(v, digits)
+
+    result.entry_zone_low  = _fmt_v(zone_low)
+    result.entry_zone_high = _fmt_v(zone_high)
+    result.entry = _fmt_v(limit_entry)
+
+    # SL dưới low ngày hoặc 5% dưới entry
+    raw_sl     = coin.low * 0.99
+    capped_sl  = limit_entry * 0.950
+    result.sl  = _fmt_v(max(raw_sl, capped_sl))
+
+    # Dynamic TP scaling — pump càng mạnh thì TP kéo xa hơn theo sức mạnh
+    # intraday_chg là % tăng từ open → giá hiện tại
+    if intraday_chg >= 100:
+        # Case cực đoan kiểu BEAT (+100%+): TP3 kéo tới +80%
+        tp1_mult, tp2_mult, tp3_mult = 1.10, 1.30, 1.800
+        fib2_mult, fib3_mult         = 1.0,  2.0
+        tp_note = f"Dynamic TP: pump +{intraday_chg:.0f}% (cực đoan) → TP3 +80%"
+    elif intraday_chg >= 60:
+        # Case rất mạnh (+60–99%): TP3 +60%
+        tp1_mult, tp2_mult, tp3_mult = 1.10, 1.25, 1.600
+        fib2_mult, fib3_mult         = 0.618, 1.618
+        tp_note = f"Dynamic TP: pump +{intraday_chg:.0f}% → TP3 +60%"
+    elif intraday_chg >= 40:
+        # Case mạnh (+40–59%): TP3 +45%
+        tp1_mult, tp2_mult, tp3_mult = 1.09, 1.22, 1.450
+        fib2_mult, fib3_mult         = 0.618, 1.0
+        tp_note = f"Dynamic TP: pump +{intraday_chg:.0f}% → TP3 +45%"
+    elif intraday_chg >= 25:
+        # Case khá mạnh (+25–39%): TP3 +35%
+        tp1_mult, tp2_mult, tp3_mult = 1.08, 1.20, 1.350
+        fib2_mult, fib3_mult         = 0.618, 1.0
+        tp_note = f"Dynamic TP: pump +{intraday_chg:.0f}% → TP3 +35%"
+    else:
+        # Base case (+15–24%): TP3 +30%
+        tp1_mult, tp2_mult, tp3_mult = 1.08, 1.18, 1.300
+        fib2_mult, fib3_mult         = 0.618, 1.0
+        tp_note = f"Dynamic TP: pump +{intraday_chg:.0f}% → TP3 +30%"
+
+    result.tp1 = _fmt_v(max(coin.high,                          limit_entry * tp1_mult))
+    result.tp2 = _fmt_v(max(coin.high + d_range * fib2_mult,   limit_entry * tp2_mult))
+    # TP3: lấy max giữa Fib và mult, nhưng cap bằng 2.5x entry để không vô lý
+    tp3_raw    = max(coin.high + d_range * fib3_mult, limit_entry * tp3_mult)
+    tp3_cap    = limit_entry * min(tp3_mult, 2.50)   # hard cap 2.5x (150% từ entry)
+    result.tp3 = _fmt_v(min(tp3_raw, tp3_cap))
+    details.append(f"📐 {tp_note}")
+
+    risk = abs(limit_entry - result.sl)
+    if risk > 0:
+        result.rr_tp1 = round(abs(result.tp1 - limit_entry) / risk, 2)
+        result.rr_tp2 = round(abs(result.tp2 - limit_entry) / risk, 2)
+
+    result.entry_now_allowed = True
+    result.entry_note = "⚡ Intraday pump đang chạy — ưu tiên chờ hồi nhẹ 2–4.5% rồi vào limit"
+    result.market_mode = "INTRADAY_PUMP"
+
+    return result
+
+
+def run_intraday_early_scan() -> list[ScoreResult]:
+    """
+    Quét intraday early detection song song 2 sàn.
+    Trả về top N coin đang pump mạnh trong ngày, sắp theo score.
+    """
+    all_results: list[ScoreResult] = []
+    scan_start = time.time()
+
+    def _scan_exchange_intraday(exchange: str) -> list[ScoreResult]:
+        symbols = get_all_symbols(exchange)
+        if not symbols:
+            return []
+        workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BYBIT
+        log.info(f"⚡ Intraday scan {exchange}: {len(symbols)} symbols...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fmap = {executor.submit(fetch_coin_data, exchange, s): s for s in symbols}
+            for future in as_completed(fmap):
+                try:
+                    coin = future.result()
+                    if coin:
+                        r = score_intraday_early(coin)
+                        if r:
+                            results.append(r)
+                except Exception as e:
+                    log.debug(f"Intraday {exchange} {fmap[future]}: {e}")
+        log.info(f"✅ Intraday {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        futures = {ex_pool.submit(_scan_exchange_intraday, ex): ex for ex in SCAN_EXCHANGES}
+        for future in as_completed(futures):
+            try:
+                all_results.extend(future.result())
+            except Exception as e:
+                log.error(f"Intraday scan error: {e}")
+
+    # Dedup — giữ bản điểm cao nhất cho mỗi symbol
+    seen: dict[str, ScoreResult] = {}
+    for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
+        base = r.symbol.upper().rstrip("M") if r.symbol.upper().endswith("USDTM") else r.symbol.upper()
+        if base not in seen:
+            seen[base] = r
+
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    log.info(f"⚡ Intraday scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
+    return final[:TOP_N_FINAL]
+
+
+def format_intraday_alert(results: list[ScoreResult]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"⚡ <b>INTRADAY EARLY PUMP — {now}</b>\n"]
+    lines.append("🔔 <i>Coin đang pump mạnh trong ngày — alert SỚM trước khi nến D đóng</i>\n")
+
+    def fmt_price(v: float) -> str:
+        return f"{v:.6g}" if v > 0 else "-"
+
+    def pct(tp, entry):
+        if entry <= 0: return ""
+        return f"{(tp - entry) / entry * 100:+.2f}%"
+
+    for i, r in enumerate(results, 1):
+        rank = "🥇" if i == 1 else "🥈"
+        sym  = html.escape(r.display_symbol if hasattr(r, "display_symbol") else r.symbol)
+        sig  = html.escape(r.signal_type)
+        lines.append(f"{'═'*30}")
+        lines.append(
+            f"{rank} <b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"⚡ <b>{sig}</b>\n"
+            f"📈 Pump: <b>+{r.price_chg:.2f}%</b> từ open | Vol: <b>{r.vol_ratio:.1f}x</b>\n"
+            f"📡 OI: <b>{r.oi_chg_pct:+.1f}%</b> | FR: <b>{r.fr:.4f}%</b>"
+        )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>\n"
+                f"📍 Entry chuẩn: <b>{fmt_price(r.entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>\n"
+                f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+            )
+        if r.entry_note:
+            lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
+        lines.append("")
+
+    lines.append("⚠️ <i>Alert sớm — nến D chưa đóng. Luôn dùng SL chặt.</i>")
+    return "\n".join(lines)
+
+
+def job_intraday_scan():
+    """Chạy mỗi 30 phút (xx:17 / xx:47 UTC) song song với monitor — scan intraday early pump."""
+    try:
+        results = run_intraday_early_scan()
+        if not results:
+            log.info("⚡ Intraday scan: không có signal đủ điều kiện.")
+            return
+        register_active_trades(results, source="INTRADAY_EARLY")
+        msg = format_intraday_alert(results)
+        if send_telegram(msg):
+            log.info(f"✅ Intraday early alert gửi: {len(results)} signal(s)")
+        else:
+            log.error("❌ Intraday early alert gửi thất bại!")
+    except Exception as e:
+        log.error(f"job_intraday_scan error: {e}", exc_info=True)
+        try:
+            send_telegram(f"❌ [intraday] error: {html.escape(str(e))}")
+        except Exception:
+            pass
+
+
+
     log.info("=" * 60)
     log.info(f"🔍 FAST SCAN {exchange} — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     log.info("=" * 60)
 
     symbols = get_all_symbols(exchange)
-    if skip_bases:
-        before = len(symbols)
-        symbols = [s for s in symbols if normalize_symbol_base(s) not in skip_bases]
-        skipped = before - len(symbols)
-        if skipped > 0:
-            log.info(f"⏭️ {exchange}: bỏ qua {skipped} coin đã quét ở sàn trước để tránh scan trùng/rate-limit")
-
     if not symbols:
-        log.warning(f"{exchange}: không còn symbol cần scan sau khi lọc trùng.")
+        log.error(f"Không lấy được danh sách symbols {exchange}!")
         return [], [], []
-
-    # V7.9: lọc nhanh bằng 24h ticker trước khi gọi full scan nhiều endpoint.
-    # Giữ được các kèo kiểu EDEN vì nằm trong top gainer/volume/mover.
-    symbols = get_fast_prefilter_symbols(exchange, symbols)
 
     pump_results: list[ScoreResult] = []
     dump_results: list[ScoreResult] = []
@@ -3585,16 +3252,15 @@ def run_scan_exchange(exchange: str, skip_bases: set[str] | None = None) -> tupl
 
 def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     """
-    Quét tuần tự theo thứ tự SCAN_EXCHANGES và KHÔNG quét lại coin đã có ở sàn trước.
+    Quét 2 sàn SONG SONG, gộp kết quả, trả về (pump_top, dump_top, reversal_top).
 
-    Ví dụ:
-      - Binance có EDENUSDT → Bybit EDENUSDT sẽ bị skip.
-      - Bybit chỉ scan coin chưa có trên Binance.
+    Kiến trúc parallel 2 tầng:
+      Tầng 1: 2 sàn chạy đồng thời (ThreadPoolExecutor MAX_WORKERS_EXCHANGES=2)
+      Tầng 2: Mỗi sàn scan symbol của mình song song (workers riêng từng sàn)
 
-    Mục tiêu:
-      - tránh trùng signal cùng 1 coin ở nhiều sàn
-      - giảm số request Binance/Bybit
-      - hạn chế lỗi 429 Too Many Requests
+    Quy tắc PUMP: lấy TOP 2; SQUEEZE ưu tiên vị trí đầu, còn lại theo total_score.
+    Quy tắc DUMP: lấy TOP 2 theo total_score.
+    Quy tắc REVERSAL: lấy tối đa TOP 2 LONG + TOP 2 SHORT, ưu tiên Binance/Bybit.
     """
     TOP_PUMP = 2
     TOP_DUMP = 2
@@ -3604,50 +3270,45 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     all_rev:  list[ScoreResult] = []
 
     scan_start = time.time()
-    scanned_bases: set[str] = set()
+    log.info(f"🚀 Parallel scan bắt đầu: {len(SCAN_EXCHANGES)} sàn đồng thời...")
 
-    log.info(f"🚀 Sequential dedup scan bắt đầu: {' | '.join(SCAN_EXCHANGES)}")
-    log.info("✅ Quy tắc: coin đã có ở Binance thì không scan lại ở Bybit")
-
-    for exchange in SCAN_EXCHANGES:
-        try:
-            pump_ex, dump_ex, rev_ex = run_scan_exchange(exchange, skip_bases=scanned_bases)
-
-            # Sau khi scan 1 sàn, đánh dấu toàn bộ symbol của sàn đó là đã xử lý
-            # để sàn sau không quét trùng nữa.
+    # Tầng 1: 3 sàn chạy song song
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
+        future_map = {
+            ex_pool.submit(run_scan_exchange, exchange): exchange
+            for exchange in SCAN_EXCHANGES
+        }
+        for future in as_completed(future_map):
+            exchange = future_map[future]
             try:
-                for sym in get_all_symbols(exchange):
-                    scanned_bases.add(normalize_symbol_base(sym))
-            except Exception:
-                for r in (pump_ex + dump_ex + rev_ex):
-                    scanned_bases.add(normalize_symbol_base(r.symbol))
+                pump_ex, dump_ex, rev_ex = future.result()
+                if PER_EXCHANGE_TOP_N:
+                    all_pump.extend(pump_ex[:TOP_N_FINAL])
+                    all_dump.extend(dump_ex[:TOP_N_FINAL])
+                    all_rev.extend(rev_ex[:TOP_N_FINAL])
+                else:
+                    all_pump.extend(pump_ex)
+                    all_dump.extend(dump_ex)
+                    all_rev.extend(rev_ex)
+                log.info(
+                    f"✅ {exchange} xong: "
+                    f"pump {len(pump_ex)} | dump {len(dump_ex)} | rev {len(rev_ex)} "
+                    f"| elapsed {time.time()-scan_start:.0f}s"
+                )
+            except Exception as e:
+                log.error(f"❌ {exchange} scan error: {e}", exc_info=True)
 
-            if PER_EXCHANGE_TOP_N:
-                all_pump.extend(pump_ex[:TOP_N_FINAL])
-                all_dump.extend(dump_ex[:TOP_N_FINAL])
-                all_rev.extend(rev_ex[:TOP_N_FINAL])
-            else:
-                all_pump.extend(pump_ex)
-                all_dump.extend(dump_ex)
-                all_rev.extend(rev_ex)
-
-            log.info(
-                f"✅ {exchange} xong: "
-                f"pump {len(pump_ex)} | dump {len(dump_ex)} | rev {len(rev_ex)} "
-                f"| total bases đã xử lý {len(scanned_bases)} "
-                f"| elapsed {time.time()-scan_start:.0f}s"
-            )
-        except Exception as e:
-            log.error(f"❌ {exchange} scan error: {e}", exc_info=True)
-
-    log.info(f"⏱️ Sequential dedup scan hoàn tất trong {time.time()-scan_start:.1f}s")
+    log.info(f"⏱️ Parallel scan hoàn tất trong {time.time()-scan_start:.1f}s")
     log.info(f"   Tổng trước dedup: pump {len(all_pump)} | dump {len(all_dump)} | rev {len(all_rev)}")
 
     def dedup(lst: list[ScoreResult]) -> list[ScoreResult]:
-        """Cùng base symbol giữ bản có điểm cao nhất."""
+        """Cùng symbol giữ bản có điểm cao nhất."""
         seen: dict[str, ScoreResult] = {}
         for r in sorted(lst, key=lambda x: x.total_score, reverse=True):
-            base = normalize_symbol_base(r.symbol)
+            base = r.symbol.upper()
+            # Với KuCoin symbol BTCUSDTM, strip M để dedup với BTCUSDT của sàn khác
+            if base.endswith("USDTM"):
+                base = base[:-1]  # BTCUSDTM → BTCUSDT
             if base not in seen:
                 seen[base] = r
         return list(seen.values())
@@ -3656,30 +3317,18 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     unique_dump = dedup(all_dump)
     unique_rev  = dedup(all_rev)
 
-    # ── PUMP: SQUEEZE / EDEN MTF ưu tiên TOP 1 ────────────────────
+    # ── PUMP: SQUEEZE ưu tiên TOP 1 ──────────────────────────────
     squeezes = [
         r for r in unique_pump
-        if r.market_mode in ("SQUEEZE", "HYBRID", "EDEN_MTF_CONTINUATION_LONG")
-        or r.squeeze_engine_score >= SQUEEZE_MIN_SCORE
-        or "EDEN" in r.signal_type
-        or "VIOLENT" in r.signal_type
+        if r.market_mode in ("SQUEEZE", "HYBRID") or r.squeeze_engine_score >= SQUEEZE_MIN_SCORE
     ]
-    squeezes.sort(
-        key=lambda x: (
-            1 if "EDEN" in x.signal_type else 0,
-            1 if "VIOLENT" in x.signal_type else 0,
-            x.squeeze_engine_score,
-            x.total_score,
-        ),
-        reverse=True,
-    )
+    squeezes.sort(key=lambda x: (1 if "VIOLENT" in x.signal_type else 0, x.squeeze_engine_score, x.total_score), reverse=True)
 
     final_pump: list[ScoreResult] = []
     if squeezes:
         top_squeeze = squeezes[0]
         final_pump.append(top_squeeze)
-        top_base = normalize_symbol_base(top_squeeze.symbol)
-        remaining = [r for r in unique_pump if normalize_symbol_base(r.symbol) != top_base]
+        remaining = [r for r in unique_pump if r.symbol.upper().rstrip("M") != top_squeeze.symbol.upper().rstrip("M")]
     else:
         remaining = unique_pump
     remaining.sort(key=lambda x: x.total_score, reverse=True)
@@ -3690,8 +3339,11 @@ def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]
     unique_dump.sort(key=lambda x: x.total_score, reverse=True)
     final_dump = unique_dump[:TOP_DUMP]
 
-    # ── REVERSAL: tắt theo yêu cầu, chỉ bật nếu ENABLE_REVERSAL_ALERTS=True ──
-    final_rev = select_top_reversal_long_short(unique_rev) if ENABLE_REVERSAL_ALERTS else []
+    # ── REVERSAL: lấy TOP 2 LONG + TOP 2 SHORT ────────────────────
+    # LONG = DUMP_REVERSAL hoặc H1_BREAKOUT_LONG
+    # SHORT = PUMP_REVERSAL hoặc H1_BREAKOUT_SHORT
+    # Ưu tiên Binance/Bybit bằng bonus nhỏ trong ranking.
+    final_rev = select_top_reversal_long_short(unique_rev)
 
     return final_pump, final_dump, final_rev
 
@@ -4911,18 +4563,17 @@ def job():
             for d in r.details:
                 log.info(f"   {d}")
 
-        if ENABLE_REVERSAL_ALERTS:
-            log.info("\n" + "=" * 60)
-            log.info("🔄 KẾT QUẢ — REVERSAL")
-            log.info("=" * 60)
-            for i, r in enumerate(rev_results, 1):
-                log.info(f"{i}. {r.display_symbol}: {r.total_score:.1f}đ — {r.reversal_type} — {r.signal_type}")
-                log.info(f"   1D: {r.price_chg:+.2f}% | 1H: {r.h1_chg:+.2f}%")
-                for d in r.details:
-                    log.info(f"   {d}")
+        log.info("\n" + "=" * 60)
+        log.info("🔄 KẾT QUẢ — REVERSAL")
+        log.info("=" * 60)
+        for i, r in enumerate(rev_results, 1):
+            log.info(f"{i}. {r.display_symbol}: {r.total_score:.1f}đ — {r.reversal_type} — {r.signal_type}")
+            log.info(f"   1D: {r.price_chg:+.2f}% | 1H: {r.h1_chg:+.2f}%")
+            for d in r.details:
+                log.info(f"   {d}")
 
         save_results(pump_results, dump_results, rev_results)
-        register_active_trades((pump_results or []) + (dump_results or []), source="TOP_D_SCAN")
+        register_active_trades((pump_results or []) + (dump_results or []) + (rev_results or []), source="HOURLY_SCAN")
         msg = format_alert(pump_results, dump_results, rev_results)
         if send_telegram(msg):
             log.info("✅ Đã gửi Telegram alert!")
@@ -5078,8 +4729,6 @@ def monitor_active_trades() -> None:
     exit_blocks = []
     status_blocks = []
     tp_blocks = []
-    closed_blocks = []
-    close_keys = []
     changed = False
 
     def _fmt(v: float) -> str:
@@ -5204,12 +4853,6 @@ def monitor_active_trades() -> None:
                     if MONITOR_REMOVE_AFTER_TP3 and t.get("tp3_alerted", False):
                         t["exit_alerted"] = True
                         t["last_status"] = "TP3_DONE"
-                        close_keys.append(key)
-                        closed_blocks.append(
-                            f"✅ <b>MONITOR CLOSED</b>\n"
-                            f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
-                            f"Reason: <b>TP3 HIT</b>"
-                        )
 
                     changed = True
                     tp_blocks.append(
@@ -5242,7 +4885,6 @@ def monitor_active_trades() -> None:
             if reasons:
                 t["exit_alerted"] = True
                 t["last_status"] = "EXIT_ALERTED"
-                close_keys.append(key)
                 changed = True
                 side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
                 exit_blocks.append(
@@ -5253,27 +4895,17 @@ def monitor_active_trades() -> None:
                     f"SL: <b>{_fmt(sl)}</b> | Funding: <b>{funding_pct:.4f}%</b>\n"
                     f"Lý do: {html.escape(', '.join(reasons))}"
                 )
-                closed_blocks.append(
-                    f"✅ <b>MONITOR CLOSED</b>\n"
-                    f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
-                    f"Reason: <b>{html.escape(', '.join(reasons))}</b>"
-                )
         except Exception as e:
             log.debug(f"Monitor lỗi {key}: {e}")
-
-    if close_keys:
-        for k in set(close_keys):
-            data.pop(k, None)
-        changed = True
 
     if changed:
         _save_active_trades(data)
 
-    blocks = status_blocks + tp_blocks + exit_blocks + closed_blocks
+    blocks = status_blocks + exit_blocks
     if blocks:
         msg = f"👁️ <b>MONITOR 30M — {now}</b>\n\n" + "\n\n".join(blocks)
         if send_telegram(msg):
-            log.info(f"👁️ Monitor gửi alert: filled={len(status_blocks)}, tp={len(tp_blocks)}, exit={len(exit_blocks)}, closed={len(closed_blocks)}")
+            log.info(f"👁️ Monitor gửi alert: filled={len(status_blocks)}, exit={len(exit_blocks)}")
         else:
             log.error("❌ Monitor gửi alert thất bại")
     else:
@@ -5319,7 +4951,7 @@ if __name__ == "__main__":
 
     else:
         # ── SCHEDULER V7.2 FIXED ─────────────────────────────────
-        # xx:02 UTC → Full scan mỗi giờ: TOP PUMP + TOP DUMP
+        # xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL
         # xx:17 / xx:47 UTC → Monitor coin đang hold: Price + CVD proxy + Funding
         # Fix: KHÔNG dùng next_hourly_slot_utc() trong loop vì dễ miss xx:02 nếu bot thức dậy sau vài giây.
         # Logic mới check theo phút hiện tại, chạy đúng 1 lần mỗi slot.
@@ -5331,9 +4963,9 @@ if __name__ == "__main__":
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
-        log.info("⏰ SCHEDULER V7.2 FIXED khởi động")
-        log.info("   xx:02 UTC → Full scan mỗi giờ: TOP PUMP + TOP DUMP")
-        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold, alert THOÁT nếu deteriorate")
+        log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
+        log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
+        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold + Intraday Early Pump scan")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
         last_full_slot = ""
@@ -5360,7 +4992,7 @@ if __name__ == "__main__":
                 elapsed = time.time() - scan_start
                 log.info(f"✅ Full scan xong {elapsed:.0f}s")
 
-            # Monitor active trades — chạy 1 lần trong phút xx:17 và xx:47 UTC
+            # Monitor active trades + Intraday early scan — chạy 1 lần trong phút xx:17 và xx:47 UTC
             if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
                 last_monitor_slot = current_slot
                 try:
@@ -5370,6 +5002,15 @@ if __name__ == "__main__":
                     log.error(f"Monitor scheduler error: {e}", exc_info=True)
                     try:
                         send_telegram(f"❌ [monitor] error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+                try:
+                    log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] Intraday early scan...")
+                    job_intraday_scan()
+                except Exception as e:
+                    log.error(f"Intraday scheduler error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ [intraday] error: {html.escape(str(e))}")
                     except Exception:
                         pass
 
