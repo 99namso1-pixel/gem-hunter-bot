@@ -3182,17 +3182,6 @@ def job_intraday_scan():
         except Exception:
             pass
 
-
-
-    log.info("=" * 60)
-    log.info(f"🔍 FAST SCAN {exchange} — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info("=" * 60)
-
-    symbols = get_all_symbols(exchange)
-    if not symbols:
-        log.error(f"Không lấy được danh sách symbols {exchange}!")
-        return [], [], []
-
     pump_results: list[ScoreResult] = []
     dump_results: list[ScoreResult] = []
     rev_results:  list[ScoreResult] = []
