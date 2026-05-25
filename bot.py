@@ -1,3 +1,4 @@
+
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -99,6 +100,7 @@ from config import (
 SCAN_EXCHANGES = ["Binance", "Bybit"]  # Chỉ quét Binance + Bybit, bỏ BingX/KuCoin để tránh lệch giá và signal nhiễu
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 2                         # Chỉ gửi 2 coin tiềm năng nhất cho mỗi TOP
+INTRADAY_TOP_N = 5                      # Hiển thị 5 coin trong Intraday Early Pump alert
 
 # ── Watchlist Mode — chỉ quét các coin trong danh sách này ────────────────
 # Đặt WATCHLIST_MODE = True để bật, False để quét toàn bộ sàn như bình thường.
@@ -3148,7 +3150,7 @@ def run_intraday_early_scan() -> list[ScoreResult]:
 
     final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
     log.info(f"⚡ Intraday scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
-    return final[:TOP_N_FINAL]
+    return final[:INTRADAY_TOP_N]
 
 
 def format_intraday_alert(results: list[ScoreResult]) -> str:
