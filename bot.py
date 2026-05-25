@@ -99,6 +99,24 @@ from config import (
 SCAN_EXCHANGES = ["Binance", "Bybit"]  # Chỉ quét Binance + Bybit, bỏ BingX/KuCoin để tránh lệch giá và signal nhiễu
 PER_EXCHANGE_TOP_N = False             # False = gộp cả 3 sàn rồi xếp điểm cao xuống thấp
 TOP_N_FINAL = 2                         # Chỉ gửi 2 coin tiềm năng nhất cho mỗi TOP
+
+# ── Watchlist Mode — chỉ quét các coin trong danh sách này ────────────────
+# Đặt WATCHLIST_MODE = True để bật, False để quét toàn bộ sàn như bình thường.
+# Thêm/bớt symbol trực tiếp vào WATCHLIST bên dưới.
+# Bot tự nhận ra symbol có/không có hậu tố USDT (ERA → ERAUSDT).
+WATCHLIST_MODE = False
+WATCHLIST: list[str] = [
+    "ERAUSDT",
+    "PLAYSOUTUSDT",
+    "PHAUSDT",
+    "SAGAUSDT",
+    "DRIFTUSDT",
+    "LAUSDT",
+    "DRAMAUSDT",
+    "THETAUSDT",
+    "AKTUSDT",
+    "XANUSDT",
+]
 AUTO_SCAN_INTERVAL_SECONDS = 3600       # Scan tự động mỗi 1 giờ
 MIN_VOL_RATIO_FILTER = 2.0              # Tăng 1.2→2.0: loại noise MOG/1INCH vol thấp (PUMP)
 MIN_PRICE_CHANGE_FILTER = 5.0           # Loại coin tăng quá yếu nếu volume không đủ (PUMP)
@@ -473,6 +491,17 @@ def get_bingx_symbols() -> list[str]:
     return sorted(set(symbols))
 
 def get_all_symbols(exchange: str) -> list[str]:
+    # Watchlist mode: chỉ trả về symbols trong WATCHLIST thay vì toàn bộ sàn
+    if WATCHLIST_MODE and WATCHLIST:
+        normalized = []
+        for s in WATCHLIST:
+            sym = s.upper()
+            if not sym.endswith("USDT"):
+                sym = sym + "USDT"
+            normalized.append(sym)
+        log.info(f"[Watchlist] {exchange}: quét {len(normalized)} symbols: {normalized}")
+        return normalized
+
     if exchange == "Binance":
         return get_binance_symbols()
     if exchange == "Bybit":
@@ -4911,6 +4940,113 @@ def monitor_active_trades() -> None:
     else:
         log.info("👁️ Monitor: chưa có fill/deterioration.")
 
+
+# ══════════════════════════════════════════════════════════════
+# TELEGRAM COMMAND HANDLER
+# ══════════════════════════════════════════════════════════════
+
+_last_update_id: int = 0
+
+
+def _poll_telegram_commands() -> None:
+    """
+    Poll Telegram getUpdates, xử lý các lệnh:
+      /watchlist              — Hiển thị trạng thái và danh sách hiện tại
+      /watchlist on           — Bật Watchlist Mode
+      /watchlist off          — Tắt Watchlist Mode (quét toàn sàn)
+      /watchlist add ERA SAGA — Thêm coin vào watchlist
+      /watchlist remove ERA   — Xóa coin khỏi watchlist
+      /watchlist clear        — Xóa toàn bộ watchlist
+      /watchlist scan         — Chạy scan ngay với watchlist hiện tại
+    """
+    global _last_update_id, WATCHLIST_MODE, WATCHLIST
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": _last_update_id + 1, "timeout": 2, "limit": 10}
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+    except Exception:
+        return
+    if not data.get("ok"):
+        return
+
+    for upd in data.get("result", []):
+        _last_update_id = upd["update_id"]
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/watchlist"):
+            continue
+
+        parts = text.split()
+        cmd   = parts[1].lower() if len(parts) > 1 else ""
+        args  = [p.upper() for p in parts[2:]]
+
+        def _reply(txt: str):
+            send_telegram(txt)
+
+        if cmd == "on":
+            WATCHLIST_MODE = True
+            _reply(f"✅ <b>Watchlist Mode BẬT</b>\n📋 {len(WATCHLIST)} coins: {', '.join(WATCHLIST) or '(trống)'}")
+
+        elif cmd == "off":
+            WATCHLIST_MODE = False
+            _reply("✅ <b>Watchlist Mode TẮT</b> — Bot sẽ quét toàn bộ sàn.")
+
+        elif cmd == "add" and args:
+            added = []
+            for a in args:
+                sym = a if a.endswith("USDT") else a + "USDT"
+                if sym not in WATCHLIST:
+                    WATCHLIST.append(sym)
+                    added.append(sym)
+            _reply(f"➕ Đã thêm: <b>{', '.join(added)}</b>\n📋 Watchlist ({len(WATCHLIST)}): {', '.join(WATCHLIST)}")
+
+        elif cmd == "remove" and args:
+            removed = []
+            for a in args:
+                sym = a if a.endswith("USDT") else a + "USDT"
+                if sym in WATCHLIST:
+                    WATCHLIST.remove(sym)
+                    removed.append(sym)
+            _reply(f"➖ Đã xóa: <b>{', '.join(removed)}</b>\n📋 Watchlist ({len(WATCHLIST)}): {', '.join(WATCHLIST)}")
+
+        elif cmd == "clear":
+            WATCHLIST.clear()
+            _reply("🗑️ Đã xóa toàn bộ watchlist.")
+
+        elif cmd == "scan":
+            if not WATCHLIST:
+                _reply("⚠️ Watchlist đang trống. Thêm coin trước: /watchlist add ERA SAGA")
+            else:
+                _reply(f"🔍 Đang scan watchlist ({len(WATCHLIST)} coins)...\n{', '.join(WATCHLIST)}")
+                old_mode = WATCHLIST_MODE
+                WATCHLIST_MODE = True
+                try:
+                    job()
+                except Exception as e:
+                    _reply(f"❌ Scan error: {html.escape(str(e))}")
+                finally:
+                    WATCHLIST_MODE = old_mode
+
+        else:
+            # Hiển thị trạng thái
+            mode_str = "🟢 BẬT" if WATCHLIST_MODE else "🔴 TẮT"
+            coins_str = "\n".join(f"  • {s}" for s in WATCHLIST) if WATCHLIST else "  (trống)"
+            _reply(
+                f"📋 <b>Watchlist Mode: {mode_str}</b>\n\n"
+                f"<b>Danh sách ({len(WATCHLIST)} coins):</b>\n{coins_str}\n\n"
+                f"<b>Lệnh:</b>\n"
+                f"  /watchlist on/off — bật/tắt\n"
+                f"  /watchlist add ERA SAGA — thêm coin\n"
+                f"  /watchlist remove ERA — xóa coin\n"
+                f"  /watchlist clear — xóa tất cả\n"
+                f"  /watchlist scan — scan ngay"
+            )
+
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
@@ -5021,5 +5157,11 @@ if __name__ == "__main__":
                     f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Full: {next_full_h:02d}:{FULL_SCAN_MINUTE:02d} UTC | "
                     f"Monitor: xx:17 / xx:47"
                 )
+
+            # Poll Telegram commands
+            try:
+                _poll_telegram_commands()
+            except Exception as e:
+                log.debug(f"Command poll error: {e}")
 
             time.sleep(CHECK_SLEEP)
