@@ -1,4 +1,3 @@
-
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -3238,6 +3237,74 @@ def job_intraday_scan():
     rev_results.sort(key=lambda x: x.total_score, reverse=True)
     log.info(f"✅ {exchange} FAST scan xong: {len(symbols)} symbols | pump {len(pump_results)} | dump {len(dump_results)} | rev {len(rev_results)} | errors {errors}")
     return pump_results, dump_results, rev_results
+
+def run_scan_exchange(exchange: str) -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
+    log.info("=" * 60)
+    log.info(f"🔍 FAST SCAN {exchange} — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info("=" * 60)
+
+    symbols = get_all_symbols(exchange)
+    if not symbols:
+        log.error(f"Không lấy được danh sách symbols {exchange}!")
+        return [], [], []
+
+    pump_results: list[ScoreResult] = []
+    dump_results: list[ScoreResult] = []
+    rev_results:  list[ScoreResult] = []
+    errors = 0
+    workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BINGX if exchange == "BingX" else MAX_WORKERS_KUCOIN if exchange == "KuCoin" else MAX_WORKERS_BYBIT
+
+    log.info(f"🚀 {exchange}: scanning {len(symbols)} symbols với {workers} workers...")
+
+    if not FAST_SCAN:
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                if i == 1 or i % LOG_EVERY_N == 0 or i == len(symbols):
+                    log.info(f"[{exchange} {i}/{len(symbols)}] Scanning...")
+                pump, dump, rev = scan_one_symbol(exchange, symbol)
+                if pump: pump_results.append(pump)
+                if dump: dump_results.append(dump)
+                if rev:  rev_results.append(rev)
+            except Exception as e:
+                errors += 1
+                log.warning(f"  ❌ {exchange} {symbol}: {e}")
+        pump_results.sort(key=lambda x: x.total_score, reverse=True)
+        dump_results.sort(key=lambda x: x.total_score, reverse=True)
+        rev_results.sort(key=lambda x: x.total_score, reverse=True)
+        log.info(f"✅ {exchange} scan xong | pump {len(pump_results)} | dump {len(dump_results)} | rev {len(rev_results)} | errors {errors}")
+        return pump_results, dump_results, rev_results
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(scan_one_symbol, exchange, s): s for s in symbols}
+
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            completed += 1
+            try:
+                pump, dump, rev = future.result()
+                if pump:
+                    pump_results.append(pump)
+                    log.info(f"  ✅ PUMP {pump.display_symbol}: {pump.total_score:.1f}đ — {pump.signal_type}")
+                if dump:
+                    dump_results.append(dump)
+                    log.info(f"  ✅ DUMP {dump.display_symbol}: {dump.total_score:.1f}đ — {dump.signal_type}")
+                if rev:
+                    rev_results.append(rev)
+                    log.info(f"  🔄 REV  {rev.display_symbol}: {rev.total_score:.1f}đ — {rev.signal_type}")
+            except Exception as e:
+                errors += 1
+                log.debug(f"  ❌ {exchange} {symbol}: {e}")
+
+            if completed == 1 or completed % LOG_EVERY_N == 0 or completed == len(symbols):
+                log.info(f"[{exchange}] Progress {completed}/{len(symbols)} | pump {len(pump_results)} | dump {len(dump_results)} | rev {len(rev_results)} | errors {errors}")
+
+    pump_results.sort(key=lambda x: x.total_score, reverse=True)
+    dump_results.sort(key=lambda x: x.total_score, reverse=True)
+    rev_results.sort(key=lambda x: x.total_score, reverse=True)
+    log.info(f"✅ {exchange} FAST scan xong: {len(symbols)} symbols | pump {len(pump_results)} | dump {len(dump_results)} | rev {len(rev_results)} | errors {errors}")
+    return pump_results, dump_results, rev_results
+
 
 def run_scan() -> tuple[list[ScoreResult], list[ScoreResult], list[ScoreResult]]:
     """
