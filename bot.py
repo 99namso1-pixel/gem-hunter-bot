@@ -1,4 +1,3 @@
-
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -174,6 +173,15 @@ H1_BREAKOUT_MIN_VOL     = 3.0    # FIX: giảm từ 5x xuống 3x để không m
 H1_BREAKOUT_MIN_SCORE   = 3.0    # FIX: giảm score để alert H1 breakout sớm hơn
 H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 
+# ── H1 Vol Spike Early Alert — bắt nến H1 đầu tiên của sóng pump ────────────
+# Trigger NGAY khi nến H1 vừa đóng với vol spike mạnh, không cần intraday_chg 15%.
+# Case OKB: nến H1 09:00 tăng +3.14% với vol 4.7x MA10 → alert lúc 09:01.
+ENABLE_H1_VOL_SPIKE     = True
+H1_EARLY_MIN_VOL        = 3.5    # Vol H1 >= 3.5x MA10
+H1_EARLY_MIN_CHG        = 2.5    # H1 tăng >= 2.5% (thấp để bắt sớm)
+H1_EARLY_OI_MIN         = 5.0    # OI spike 1 nến >= 5%
+H1_EARLY_MIN_SCORE      = 4.0    # Score tối thiểu để lọt
+
 # ── Intraday Early Detection — bắt pump đang hình thành trong nến D ────────
 # Mục tiêu: alert sớm khi coin đang pump mạnh TRONG ngày, không cần đợi nến D đóng.
 # Trigger khi nến 1D live đã tăng >= ngưỡng từ open, vol đủ mạnh, FR âm.
@@ -293,6 +301,7 @@ class CoinData:
     h1_volume: float = 0
     h1_vol_ma10: float = 0
     h1_price_change_pct: float = 0
+    h1_vol_ratio: float = 0          # h1_volume / h1_vol_ma10 — dùng cho H1 early spike
     h1_available: bool = False         # True nếu lấy được 1H data
     # M30 data — xác nhận momentum cho reversal scan 30 phút
     m30_open: float = 0
@@ -1207,6 +1216,7 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
                 coin.h1_price_change_pct = (coin.h1_close - coin.h1_open) / coin.h1_open * 100
             prev_h1_vols = [float(c.get("v", 0)) for c in h1_candles[-11:-1]]
             coin.h1_vol_ma10 = sum(prev_h1_vols) / len(prev_h1_vols) if prev_h1_vols else 0
+            coin.h1_vol_ratio = coin.h1_volume / coin.h1_vol_ma10 if coin.h1_vol_ma10 > 0 else 0
             coin.h1_available = True
 
     # ── M30 data — xác nhận momentum cho reversal scan ───────────
@@ -3104,6 +3114,157 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     return result
 
 
+def score_h1_vol_spike(coin: CoinData) -> Optional["ScoreResult"]:
+    """
+    H1 Vol Spike Early Alert — bắt NGAY nến H1 đầu tiên của sóng pump.
+
+    Không đợi intraday_chg 15%. Trigger khi nến H1 vừa đóng với:
+      • Vol H1 >= H1_EARLY_MIN_VOL x MA10
+      • H1 tăng >= H1_EARLY_MIN_CHG%
+      • OI spike >= H1_EARLY_OI_MIN% (1 nến)
+
+    Case OKB: vol 4.7x + H1 +3.14% + OI +6.1% → alert lúc 09:01, entry ~85 thay vì 94.
+    """
+    if not ENABLE_H1_VOL_SPIKE:
+        return None
+    if not coin.h1_available or coin.h1_vol_ma10 <= 0:
+        return None
+
+    h1_chg      = coin.h1_price_change_pct
+    h1_vol_r    = coin.h1_vol_ratio
+    fr_pct      = coin.funding_rate * 100
+
+    # Filter cứng
+    if h1_chg < H1_EARLY_MIN_CHG:
+        return None
+    if h1_vol_r < H1_EARLY_MIN_VOL:
+        return None
+    if coin.oi_spike_pct < H1_EARLY_OI_MIN:
+        return None
+
+    result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    result.timeframe     = "1H-SPIKE"
+    result.reversal_type = "H1_VOL_SPIKE_LONG"
+    result.vol_ratio     = round(h1_vol_r, 2)
+    result.oi_chg_pct    = round(coin.oi_spike_pct, 1)
+    result.fr            = round(fr_pct, 4)
+    result.lsr           = round(coin.lsr, 4)
+    result.price_current = round(coin.h1_close, 8)
+    result.price_chg     = round(h1_chg, 2)
+
+    score   = 0.0
+    details = []
+
+    details.append(f"⚡ H1 Vol Spike: {coin.h1_open:.6g} → {coin.h1_close:.6g} (+{h1_chg:.2f}%)")
+
+    # Vol spike — chỉ số quan trọng nhất
+    if h1_vol_r >= 8:
+        score += 3.5; details.append(f"💥 Vol H1 cực mạnh: {h1_vol_r:.1f}x MA10")
+    elif h1_vol_r >= 5:
+        score += 2.5; details.append(f"💥 Vol H1 mạnh: {h1_vol_r:.1f}x MA10")
+    else:
+        score += 1.5; details.append(f"📊 Vol H1 spike: {h1_vol_r:.1f}x MA10")
+
+    # H1 price change
+    if h1_chg >= 8:
+        score += 2.5; details.append(f"🚀 H1 pump mạnh: +{h1_chg:.2f}%")
+    elif h1_chg >= 5:
+        score += 1.5; details.append(f"📈 H1 pump: +{h1_chg:.2f}%")
+    else:
+        score += 0.8; details.append(f"📈 H1 tăng: +{h1_chg:.2f}%")
+
+    # OI spike 1 nến
+    if coin.oi_spike_pct >= 20:
+        score += 2.5; details.append(f"🚀 OI spike: +{coin.oi_spike_pct:.1f}% — tiền mới vào mạnh")
+    elif coin.oi_spike_pct >= 10:
+        score += 1.5; details.append(f"💥 OI spike: +{coin.oi_spike_pct:.1f}%")
+    else:
+        score += 0.8; details.append(f"📡 OI tăng: +{coin.oi_spike_pct:.1f}%")
+
+    # FR âm = squeeze fuel bonus
+    if fr_pct <= -0.5:
+        score += 3.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%) — squeeze mạnh")
+    elif fr_pct <= -0.1:
+        score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%)")
+    elif fr_pct <= -0.02:
+        score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
+    elif fr_pct > 0.1:
+        score -= 0.5; details.append(f"⚠️ FR dương ({fr_pct:.4f}%) — longs đang trả phí")
+
+    # OI trend dài (4 nến) xác nhận accumulation
+    if coin.oi_change_pct >= 15:
+        score += 1.0; details.append(f"📡 OI trend tăng: +{coin.oi_change_pct:.1f}%")
+
+    # Shorts bị liq > longs = cascade up
+    if coin.liq_ratio >= 3:
+        score += 2.0; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x longs — cascade")
+    elif coin.liq_ratio >= 1.5:
+        score += 1.0; details.append(f"✅ Shorts liq {coin.liq_ratio:.1f}x")
+
+    # D1 trend — nến ngày cùng chiều
+    if coin.price_change_pct >= 5:
+        score += 1.0; details.append(f"✅ D1 cùng chiều: +{coin.price_change_pct:.1f}%")
+
+    result.total_score = round(score, 1)
+    result.details     = details
+
+    if result.total_score < H1_EARLY_MIN_SCORE:
+        return None
+
+    # Signal label
+    if score >= 12:
+        result.signal_type = "⚡🔥 H1 VOL SPIKE — CỰC MẠNH"
+    elif score >= 8:
+        result.signal_type = "⚡🚀 H1 VOL SPIKE — RẤT MẠNH"
+    elif score >= 6:
+        result.signal_type = "⚡📈 H1 Vol Spike — Mạnh"
+    else:
+        result.signal_type = "⚡ H1 Vol Spike Early"
+
+    # TP/SL — entry ngay sau nến H1 vừa đóng
+    import math as _math
+    def _fmtv(v: float) -> float:
+        if v == 0: return 0.0
+        d = max(2, -int(_math.floor(_math.log10(abs(v)))) + 3)
+        return round(v, d)
+
+    entry       = coin.h1_close
+    zone_high   = entry * 1.005   # Buy zone: ngay trên close H1 hoặc retest nhẹ
+    zone_low    = entry * 0.980
+    limit_entry = (zone_high + zone_low) / 2
+
+    result.entry_zone_low  = _fmtv(zone_low)
+    result.entry_zone_high = _fmtv(zone_high)
+    result.entry           = _fmtv(limit_entry)
+
+    # SL: dưới low H1 hoặc 4% dưới entry
+    result.sl = _fmtv(max(coin.h1_low * 0.995, limit_entry * 0.960))
+
+    # TP dynamic — dựa vào h1_chg để scale
+    d_range = coin.high - coin.low  # range ngày
+    if h1_chg >= 8:
+        tp1_m, tp2_m, tp3_m = 1.08, 1.18, 1.35
+    elif h1_chg >= 5:
+        tp1_m, tp2_m, tp3_m = 1.07, 1.15, 1.28
+    else:
+        tp1_m, tp2_m, tp3_m = 1.06, 1.12, 1.22
+
+    result.tp1 = _fmtv(max(coin.h1_high * 1.01,             limit_entry * tp1_m))
+    result.tp2 = _fmtv(max(coin.h1_high + d_range * 0.382,  limit_entry * tp2_m))
+    result.tp3 = _fmtv(max(coin.h1_high + d_range * 0.618,  limit_entry * tp3_m))
+
+    risk = abs(limit_entry - result.sl)
+    if risk > 0:
+        result.rr_tp1 = round(abs(result.tp1 - limit_entry) / risk, 2)
+        result.rr_tp2 = round(abs(result.tp2 - limit_entry) / risk, 2)
+
+    result.entry_now_allowed = True
+    result.entry_note = f"⚡ H1 vừa đóng vol {h1_vol_r:.1f}x — vào ngay hoặc chờ retest 1–2% nến H1 tiếp"
+    result.market_mode = "H1_SPIKE"
+
+    return result
+
+
 def run_intraday_early_scan() -> list[ScoreResult]:
     """
     Quét intraday early detection song song 2 sàn.
@@ -3125,9 +3286,14 @@ def run_intraday_early_scan() -> list[ScoreResult]:
                 try:
                     coin = future.result()
                     if coin:
+                        # Intraday D-level early (pump 15%+ từ open ngày)
                         r = score_intraday_early(coin)
                         if r:
                             results.append(r)
+                        # H1 Vol Spike — bắt ngay nến H1 đầu tiên của sóng
+                        r_h1 = score_h1_vol_spike(coin)
+                        if r_h1:
+                            results.append(r_h1)
                 except Exception as e:
                     log.debug(f"Intraday {exchange} {fmap[future]}: {e}")
         log.info(f"✅ Intraday {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
@@ -3156,7 +3322,7 @@ def run_intraday_early_scan() -> list[ScoreResult]:
 def format_intraday_alert(results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"⚡ <b>INTRADAY EARLY PUMP — {now}</b>\n"]
-    lines.append("🔔 <i>Coin đang pump mạnh trong ngày — alert SỚM trước khi nến D đóng</i>\n")
+    lines.append("🔔 <i>H1 Vol Spike + Intraday pump sớm — alert trước khi nến D đóng</i>\n")
 
     def fmt_price(v: float) -> str:
         return f"{v:.6g}" if v > 0 else "-"
