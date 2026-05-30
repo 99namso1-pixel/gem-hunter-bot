@@ -140,8 +140,8 @@ DEADCAT_RETRACE_MIN = 0.382          # Entry zone short: hồi 38.2% nhịp dump
 DEADCAT_RETRACE_MAX = 0.618          # Entry zone short: hồi 61.8% nhịp dump
 
 # ── 1H Reversal Engine ────────────────────────────────────────
-ENABLE_1H_REVERSAL = True              # Bật/tắt scan 1H reversal
-ENABLE_30MIN_SCAN = True               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
+ENABLE_1H_REVERSAL = False              # Bật/tắt scan 1H reversal
+ENABLE_30MIN_SCAN = False               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
 DAILY_SCAN_HOUR   = 0                  # Giờ UTC chạy full scan 1D (0 = 00:02 UTC)
 # Pump Reversal: coin pump mạnh 1D nhưng 1H đang đảo chiều xuống
 PUMP_REV_1D_MIN_PUMP = 10.0           # 1D tăng tối thiểu 10% trước đó
@@ -3886,7 +3886,6 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
             + (f"\n{cvd_line}" if cvd_line else "") +
             f"\nFR: <b>{r.fr:.4f}%</b>"
         )
-     
         if r.entry_note:
             lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
         lines.append("")
@@ -3896,7 +3895,7 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
 
 
 def job_intraday_scan():
-    """Chạy mỗi 30 phút (xx:17 / xx:47 UTC) — scan intraday early pump + H1 spike + quiet accum."""
+    """Chạy mỗi 30 phút (xx:02 / xx:32 UTC) — chỉ scan và alert INTRADAY EARLY PUMP."""
     try:
         results = run_intraday_early_scan()
         if not results:
@@ -5580,19 +5579,19 @@ if __name__ == "__main__":
     else:
         # ── SCHEDULER V7.2 FIXED ─────────────────────────────────
         # xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL
-        # xx:17 / xx:47 UTC → Monitor coin đang hold: Price + CVD proxy + Funding
+        # xx:02 / xx:32 UTC → Intraday Early Pump scan
         # Fix: KHÔNG dùng next_hourly_slot_utc() trong loop vì dễ miss xx:02 nếu bot thức dậy sau vài giây.
         # Logic mới check theo phút hiện tại, chạy đúng 1 lần mỗi slot.
 
         FULL_SCAN_MINUTE = 2
-        MONITOR_MINUTES = (17, 47)
+        MONITOR_MINUTES = (2, 32)
         CHECK_SLEEP = 10
 
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
         log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:17 / xx:47 UTC → Intraday Early Pump scan → Telegram")
+        log.info("   xx:02 / xx:32 UTC → Intraday Early Pump scan → Telegram")
         log.info("   --now → chạy Intraday Early Pump scan ngay")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
@@ -5605,9 +5604,9 @@ if __name__ == "__main__":
             current_slot = slot_id(now)
 
             # ĐÃ TẮT: Full 1D / H1 Spike / H2 Gem Telegram
-            # Bot chỉ gửi Telegram khi có INTRADAY EARLY PUMP tại xx:17 / xx:47 UTC.
+            # Bot chỉ gửi Telegram khi có INTRADAY EARLY PUMP tại xx:02 / xx:32 UTC.
 
-            # Intraday early scan — chạy tại xx:17 và xx:47 UTC
+            # Intraday early scan — chạy tại xx:02 và xx:32 UTC
             if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
                 last_monitor_slot = current_slot
                 try:
@@ -5624,7 +5623,7 @@ if __name__ == "__main__":
             if now.second < CHECK_SLEEP:
                 next_full_h = now.hour if now.minute < FULL_SCAN_MINUTE else (now.hour + 1) % 24
                 log.info(
-                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Intraday Early Pump: xx:17 / xx:47 UTC"
+                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Intraday Early Pump: xx:02 / xx:32 UTC"
                 )
 
             # Poll Telegram commands
