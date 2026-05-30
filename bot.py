@@ -3878,6 +3878,12 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
         cvd_line = " | ".join(cvd_status) if cvd_status else ""
 
         lines.append(f"{'═'*30}")
+        price_line = f"💰 Giá hiện tại: <b>{fmt_price(r.price_current)}</b>"
+        if r.entry_zone_low > 0 and r.entry_zone_high > 0:
+            buy_zone_line = f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>"
+        else:
+            buy_zone_line = ""
+
         lines.append(
             f"{rank} <b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
             f"⚡ <b>{sig}</b>\n"
@@ -3885,12 +3891,9 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
             f"{oi_line}"
             + (f"\n{cvd_line}" if cvd_line else "") +
             f"\nFR: <b>{r.fr:.4f}%</b>"
+            f"\n{price_line}"
+            + (f"\n{buy_zone_line}" if buy_zone_line else "")
         )
-
-        if r.entry > 0 and r.tp1 > 0:
-    lines.append(
-        f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>\n"
-    )
         if r.entry_note:
             lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
         lines.append("")
