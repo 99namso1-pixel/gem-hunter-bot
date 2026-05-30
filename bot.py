@@ -3886,6 +3886,11 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
             + (f"\n{cvd_line}" if cvd_line else "") +
             f"\nFR: <b>{r.fr:.4f}%</b>"
         )
+
+        if r.entry > 0 and r.tp1 > 0:
+    lines.append(
+        f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>\n"
+    )
         if r.entry_note:
             lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
         lines.append("")
