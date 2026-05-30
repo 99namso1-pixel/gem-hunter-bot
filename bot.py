@@ -1,3 +1,4 @@
+
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -3591,7 +3592,7 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
 
 
 def job_intraday_scan():
-    """Chạy mỗi 30 phút (xx:17 / xx:47 UTC) song song với monitor — scan intraday early pump."""
+    """Chạy mỗi 30 phút (xx:17 / xx:47 UTC) — scan intraday early pump + H1 spike + quiet accum."""
     try:
         results = run_intraday_early_scan()
         if not results:
@@ -3607,6 +3608,113 @@ def job_intraday_scan():
         log.error(f"job_intraday_scan error: {e}", exc_info=True)
         try:
             send_telegram(f"❌ [intraday] error: {html.escape(str(e))}")
+        except Exception:
+            pass
+
+
+def run_h1_spike_scan() -> list[ScoreResult]:
+    """Quét H1 Vol Spike toàn sàn — chạy mỗi giờ ngay sau khi nến H1 đóng."""
+    all_results: list[ScoreResult] = []
+    scan_start = time.time()
+
+    def _scan_one(exchange: str) -> list[ScoreResult]:
+        symbols = get_all_symbols(exchange)
+        if not symbols:
+            return []
+        workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BYBIT
+        log.info(f"⚡ H1 spike scan {exchange}: {len(symbols)} symbols...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fmap = {executor.submit(fetch_coin_data, exchange, s): s for s in symbols}
+            for future in as_completed(fmap):
+                try:
+                    coin = future.result()
+                    if not coin:
+                        continue
+                    # H1 Vol Spike
+                    r = score_h1_vol_spike(coin)
+                    if r:
+                        results.append(r)
+                    # Quiet Accumulation
+                    r_qa = score_quiet_accumulation(coin)
+                    if r_qa:
+                        results.append(r_qa)
+                except Exception as e:
+                    log.debug(f"H1 spike {exchange} {fmap[future]}: {e}")
+        log.info(f"✅ H1 spike {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as pool:
+        for res in pool.map(_scan_one, SCAN_EXCHANGES):
+            all_results.extend(res)
+
+    # Dedup
+    seen: dict[str, ScoreResult] = {}
+    for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
+        base = r.symbol.upper()
+        if base not in seen:
+            seen[base] = r
+
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    log.info(f"⚡ H1 spike scan xong {time.time()-scan_start:.1f}s | {len(final)} unique")
+    return final[:INTRADAY_TOP_N]
+
+
+def format_h1_spike_alert(results: list[ScoreResult]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"⚡ <b>H1 VOL SPIKE — {now}</b>\n"]
+    lines.append("🔔 <i>Nến H1 vừa đóng với OI Delta + Vol spike bất thường</i>\n")
+
+    def fp(v: float) -> str:
+        return f"{v:.6g}" if v > 0 else "-"
+
+    def pct(tp, entry):
+        if entry <= 0: return ""
+        return f"{(tp - entry) / entry * 100:+.1f}%"
+
+    for i, r in enumerate(results, 1):
+        rank = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        sym  = html.escape(getattr(r, "display_symbol", r.symbol))
+        sig  = html.escape(r.signal_type)
+        mode = html.escape(r.market_mode or "")
+        lines.append(f"{'═'*28}")
+        lines.append(
+            f"{rank} <b>{sym} · {html.escape(r.exchange)}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"<b>{sig}</b>\n"
+            f"📈 H1: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b> | OI: <b>{r.oi_chg_pct:+.1f}%</b>\n"
+            f"FR: <b>{r.fr:.4f}%</b> | {mode}"
+        )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"🎯 Entry: <b>{fp(r.entry)}</b> | SL: <b>{fp(r.sl)}</b>\n"
+                f"🎯 TP1: <b>{fp(r.tp1)}</b> <i>({pct(r.tp1, r.entry)})</i>\n"
+                f"🎯 TP2: <b>{fp(r.tp2)}</b> <i>({pct(r.tp2, r.entry)})</i>\n"
+                f"🎯 TP3: <b>{fp(r.tp3)}</b> <i>({pct(r.tp3, r.entry)})</i>"
+            )
+        if r.entry_note:
+            lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
+        lines.append("")
+
+    lines.append("⚠️ <i>Alert H1 — vào sớm, SL chặt theo low H1.</i>")
+    return "\n".join(lines)
+
+
+def job_h1_spike_scan():
+    """Chạy mỗi giờ tại xx:05 UTC — ngay sau khi nến H1 đóng (H1 đóng tại xx:00)."""
+    try:
+        results = run_h1_spike_scan()
+        if not results:
+            log.info("⚡ H1 spike scan: không có signal đủ điều kiện.")
+            return
+        msg = format_h1_spike_alert(results)
+        if send_telegram(msg):
+            log.info(f"✅ H1 spike alert gửi: {len(results)} signal(s)")
+        else:
+            log.error("❌ H1 spike alert gửi thất bại!")
+    except Exception as e:
+        log.error(f"job_h1_spike_scan error: {e}", exc_info=True)
+        try:
+            send_telegram(f"❌ [h1spike] error: {html.escape(str(e))}")
         except Exception:
             pass
 
@@ -4951,22 +5059,6 @@ def format_h2_alert(pump: list[ScoreResult], dump: list[ScoreResult]) -> str:
     return "\n".join(lines)
 
 
-def job_h2_scan():
-    """Chạy mỗi 2H — scan H2 pump/dump, alert nếu có signal."""
-    try:
-        pump, dump = run_h2_scan()
-        if not pump and not dump:
-            log.info("⚡ H2 scan xong — không có signal.")
-            return
-        msg = format_h2_alert(pump, dump)
-        if send_telegram(msg):
-            log.info(f"✅ H2 alert gửi: pump {len(pump)} dump {len(dump)}")
-        else:
-            log.error("❌ H2 alert gửi thất bại!")
-    except Exception as e:
-        log.error(f"job_h2_scan error: {e}", exc_info=True)
-
-
 def job():
     try:
         pump_results, dump_results, rev_results = run_scan()
@@ -5603,7 +5695,8 @@ if __name__ == "__main__":
             return dt.strftime("%Y%m%d%H%M")
 
         log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:02 UTC → Full scan mỗi giờ (log only, không Telegram)")
+        log.info("   xx:02 UTC → Full 1D scan (log only)")
+        log.info("   xx:05 UTC → H1 Vol Spike scan mỗi giờ → Telegram")
         log.info("   00:03/02:03/.../22:03 UTC → H2 Gem Scan mỗi 2 tiếng → Telegram")
         log.info("   xx:17 / xx:47 UTC → Intraday Early Pump scan → Telegram")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
@@ -5611,6 +5704,7 @@ if __name__ == "__main__":
         last_full_slot    = ""
         last_monitor_slot = ""
         last_h2_slot      = ""
+        last_h1_slot      = ""
 
         while True:
             now = datetime.now(timezone.utc)
@@ -5633,7 +5727,20 @@ if __name__ == "__main__":
                 elapsed = time.time() - scan_start
                 log.info(f"✅ Full scan xong {elapsed:.0f}s")
 
-            # H2 Gem Scan — chạy mỗi 2 tiếng tại xx:03 của giờ chẵn (00,02,04,06...)
+            # H1 Vol Spike scan — mỗi giờ tại xx:05 UTC (5 phút sau nến H1 đóng)
+            if now.minute == 5 and current_slot != last_h1_slot:
+                last_h1_slot = current_slot
+                try:
+                    log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] H1 Vol Spike scan...")
+                    job_h1_spike_scan()
+                except Exception as e:
+                    log.error(f"H1 spike scheduler error: {e}", exc_info=True)
+                    try:
+                        send_telegram(f"❌ [h1spike] error: {html.escape(str(e))}")
+                    except Exception:
+                        pass
+
+            # H2 Gem Scan — chạy mỗi 2 tiếng tại xx:03 của giờ chẵn
             h2_slot_id = f"{now.year}{now.month:02d}{now.day:02d}{now.hour:02d}_h2"
             if now.minute == H2_SCAN_MINUTE and now.hour % 2 == 0 and h2_slot_id != last_h2_slot:
                 last_h2_slot = h2_slot_id
