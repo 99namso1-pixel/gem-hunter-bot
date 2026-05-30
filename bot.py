@@ -177,7 +177,7 @@ H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 # ── H1 Vol Spike Early Alert — bắt nến H1 đầu tiên của sóng pump ────────────
 # Trigger NGAY khi nến H1 vừa đóng với vol spike mạnh, không cần intraday_chg 15%.
 # Case OKB: nến H1 09:00 tăng +3.14% với vol 4.7x MA10 → alert lúc 09:01.
-ENABLE_H1_VOL_SPIKE     = True
+ENABLE_H1_VOL_SPIKE     = False  # OFF: chỉ gửi INTRADAY EARLY PUMP
 H1_EARLY_MIN_VOL        = 3.5    # Vol H1 >= 3.5x MA10
 H1_EARLY_MIN_CHG        = 2.5    # H1 tăng >= 2.5% (thấp để bắt sớm)
 H1_EARLY_OI_MIN         = 5.0    # OI spike 1 nến >= 5%
@@ -186,7 +186,7 @@ H1_EARLY_MIN_SCORE      = 4.0    # Score tối thiểu để lọt
 # ── Quiet Accumulation Detector — bắt tích lũy im lặng trước pump ────────────
 # Vol thấp + giá đứng yên NHƯNG OI Delta tăng đột biến = smart money đang vào.
 # Case HEI 28/5: vol 0.4x MA10 + giá +1.15% nhưng OI Delta bắt đầu tăng → pump tiếp theo +96%.
-ENABLE_QUIET_ACCUM      = True
+ENABLE_QUIET_ACCUM      = False  # OFF: chỉ gửi INTRADAY EARLY PUMP
 QUIET_ACCUM_MAX_VOL     = 1.2    # Vol <= 1.2x MA10 (im lặng)
 QUIET_ACCUM_MAX_CHG     = 5.0    # Giá thay đổi <= 5% (không pump rõ)
 QUIET_ACCUM_OI_DELTA    = 3.0    # OI Delta tăng >= 3x so với trung bình (đột biến)
@@ -202,6 +202,14 @@ INTRADAY_EARLY_MIN_VOL  = 3.0    # Vol hiện tại >= 3x MA10 vol ngày
 INTRADAY_EARLY_FR_DEEP  = -0.15  # FR âm <= -0.15% → squeeze fuel bonus
 INTRADAY_EARLY_OI_MIN   = 15.0   # OI tăng >= 15% → xác nhận dòng tiền thật
 INTRADAY_EARLY_MIN_SCORE = 3.0   # Score tối thiểu để lọt list
+
+# ── Smart Money / Baseline priority ───────────────────────────
+# Ưu tiên coin TRIPLE CONFIRMED + mới thoát nền baseline, tránh coin đã pump quá xa.
+SMART_BASELINE_ULTRA_EARLY = 5.0      # <=5% trên baseline = cực sớm
+SMART_BASELINE_EARLY       = 8.0      # <=8% trên baseline = mới thoát nền
+SMART_BASELINE_OK          = 15.0     # <=15% vẫn còn ổn
+SMART_OVEREXTENDED_PCT     = 25.0     # >25% trên baseline = đã chạy xa, trừ điểm
+SMART_OI_DELTA_STRONG      = 2.0      # OI Delta >=2x baseline để xác nhận tiền mới vào
 
 # Engine mode
 TREND_MIN_SCORE = 5.0                   # Ngưỡng nhận diện TREND coin kiểu IRYS
@@ -309,6 +317,8 @@ class CoinData:
     liq_ratio: float = 0
     # Long-term low
     low_20d: float = 0
+    baseline_ma20: float = 0          # Baseline MA20 daily trước nến hiện tại
+    baseline_break_pct: float = 0     # % close hiện tại so với baseline MA20
     # 1D lookback: % change của 2 nến ngày trước (để bắt reversal sau pump/dump hôm qua)
     prev1d_change_pct: float = 0   # nến[-2]: hôm qua
     prev2d_change_pct: float = 0   # nến[-3]: hôm kia
@@ -362,6 +372,7 @@ class ScoreResult:
     price_chg: float = 0
     price_current: float = 0    # Giá hiện tại (close nến gần nhất)
     day_low: float = 0          # Giá thấp nhất trong ngày
+    baseline_break_pct: float = 0 # % giá hiện tại so với baseline MA20
     timeframe: str = "1D"       # "1D" hoặc "1H" hoặc "REV"
     reversal_type: str = ""     # "PUMP_REVERSAL" / "DUMP_REVERSAL" / "H1_BREAKOUT_LONG" / "H1_BREAKOUT_SHORT"
     h1_chg: float = 0           # % thay đổi nến 1H gần nhất
@@ -1321,6 +1332,13 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
 
     lows_20 = [float(c.get("l", 0)) for c in candles[-21:-1]]
     coin.low_20d = min(lows_20) if lows_20 else 0
+
+    # Baseline MA20 daily: dùng 20 nến trước nến hiện tại để xem coin mới thoát nền hay đã chạy xa.
+    prev_closes_20 = [float(c.get("c", 0)) for c in candles[-21:-1] if float(c.get("c", 0)) > 0]
+    if prev_closes_20:
+        coin.baseline_ma20 = sum(prev_closes_20) / len(prev_closes_20)
+        if coin.baseline_ma20 > 0:
+            coin.baseline_break_pct = (coin.close / coin.baseline_ma20 - 1.0) * 100.0
 
     fr = get_funding_rate(exchange, symbol)
     coin.funding_rate = fr if fr is not None else 0
@@ -3175,11 +3193,18 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     vol_ratio    = coin.volume / coin.vol_ma10 if coin.vol_ma10 > 0 else 0
     fr_pct       = coin.funding_rate * 100
     oi_delta_r   = abs(coin.oi_delta) / coin.oi_delta_avg if coin.oi_delta_avg > 0 else 0
+    baseline_pct = coin.baseline_break_pct if coin.baseline_ma20 > 0 else 999.0
 
-    # Filter cứng
-    if intraday_chg < INTRADAY_EARLY_MIN_CHG:
+    # Smart-money bypass: nếu TRIPLE CONFIRMED + OI Delta mới tăng từ baseline,
+    # vẫn cho lọt dù intraday_chg/vol chưa đạt ngưỡng cứng.
+    triple_confirmed_pre = (coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG)
+    early_from_baseline  = (0 <= baseline_pct <= SMART_BASELINE_EARLY)
+    smart_money_early    = triple_confirmed_pre and early_from_baseline
+
+    # Filter cứng — nhưng cho phép bypass với SMART MONEY EARLY.
+    if intraday_chg < INTRADAY_EARLY_MIN_CHG and not smart_money_early:
         return None
-    if vol_ratio < INTRADAY_EARLY_MIN_VOL:
+    if vol_ratio < INTRADAY_EARLY_MIN_VOL and not smart_money_early:
         return None
 
     result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
@@ -3194,20 +3219,34 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     result.price_current = round(coin.close, 8)
     result.price_chg     = round(intraday_chg, 2)
     result.day_low       = round(coin.low, 8)
+    result.baseline_break_pct = round(baseline_pct, 2) if baseline_pct != 999.0 else 0
 
     score   = 0.0
     details = []
     details.append(f"⚡ Intraday Pump: open {coin.open:.6g} → now {coin.close:.6g} (+{intraday_chg:.1f}%)")
+    if coin.baseline_ma20 > 0:
+        details.append(f"🧱 Baseline MA20: {coin.baseline_ma20:.6g} | Break: {baseline_pct:+.1f}%")
+
+    # ── 0. BASELINE PRIORITY — mới thoát nền được cộng mạnh, chạy xa bị trừ ──
+    if 0 <= baseline_pct <= SMART_BASELINE_ULTRA_EARLY:
+        score += 6.0; details.append(f"🧠 Vừa thoát baseline +{baseline_pct:.1f}% — CỰC SỚM, ưu tiên TOP")
+    elif 0 <= baseline_pct <= SMART_BASELINE_EARLY:
+        score += 4.0; details.append(f"🧠 Mới thoát baseline +{baseline_pct:.1f}% — smart money zone")
+    elif 0 <= baseline_pct <= SMART_BASELINE_OK:
+        score += 2.0; details.append(f"✅ Còn gần baseline +{baseline_pct:.1f}%")
+    elif baseline_pct > SMART_OVEREXTENDED_PCT:
+        penalty = 7.0 if baseline_pct >= 40 else 4.0
+        score -= penalty; details.append(f"⚠️ Đã chạy xa baseline +{baseline_pct:.1f}% — trừ {penalty:.0f} điểm, tránh FOMO")
 
     # ── 1. OI DELTA — yếu tố chính (max 5đ) ──────────────────────────────
     if coin.oi_delta > 0:
-        if oi_delta_r >= 10:
+        if oi_delta_r >= 4:
             score += 5.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
-        elif oi_delta_r >= 6:
-            score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline — rất mạnh")
         elif oi_delta_r >= 3:
+            score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline — rất mạnh")
+        elif oi_delta_r >= 2:
             score += 3.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline — mạnh")
-        else:
+        elif oi_delta_r >= 1:
             score += 1.5; details.append(f"📡 OI Delta tăng (x{oi_delta_r:.1f})")
     else:
         details.append("⚠️ OI Delta âm — không có tiền mới vào")
@@ -3281,8 +3320,13 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
         result.details.append(f"⚠️ CVD Spot không rising")
 
     # OI Delta tăng + cả 2 CVD rising = TRIPLE CONFIRM — tín hiệu mạnh nhất
-    if coin.oi_delta > 0 and coin.cvd_both_rising:
-        cvd_score += 4.0; result.details.append(f"🚀🚀 TRIPLE CONFIRM: OI Delta tăng + CVD Futures rising + CVD Spot rising!")
+    triple_confirmed = coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG
+    if triple_confirmed:
+        cvd_score += 5.0; result.details.append(f"🚀🚀 TRIPLE CONFIRMED: OI Delta {oi_delta_r:.1f}x + CVD Futures rising + CVD Spot rising — ƯU TIÊN TỐI ĐA")
+        if 0 <= baseline_pct <= SMART_BASELINE_EARLY:
+            cvd_score += 3.0; result.details.append(f"🧠 SMART MONEY ENTRY: Triple Confirmed + mới tăng từ baseline +{baseline_pct:.1f}%")
+        if fr_pct < 0:
+            cvd_score += 2.0; result.details.append(f"💣 Funding âm + Triple Confirmed — có squeeze fuel")
     elif coin.oi_delta > 0 and coin.cvd_fut_rising:
         cvd_score += 2.0; result.details.append(f"✅ DOUBLE CONFIRM: OI Delta + CVD Futures rising")
 
@@ -3291,7 +3335,10 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < INTRADAY_EARLY_MIN_SCORE:
         return None
 
-    if coin.oi_delta > 0 and coin.cvd_both_rising and result.total_score >= 14:
+    triple_confirmed_final = coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG
+    if triple_confirmed_final and 0 <= baseline_pct <= SMART_BASELINE_EARLY:
+        result.signal_type = "🧠🚀 SMART MONEY ENTRY — TRIPLE CONFIRMED + BASELINE EARLY"
+    elif triple_confirmed_final and result.total_score >= 14:
         result.signal_type = "⚡💥🚀 INTRADAY PUMP — TRIPLE CONFIRMED"
     elif result.total_score >= 12:
         result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (OI Delta bùng nổ)"
@@ -3756,14 +3803,8 @@ def run_intraday_early_scan() -> list[ScoreResult]:
                         r = score_intraday_early(coin)
                         if r:
                             results.append(r)
-                        # H1 Vol Spike — bắt ngay nến H1 đầu tiên của sóng
-                        r_h1 = score_h1_vol_spike(coin)
-                        if r_h1:
-                            results.append(r_h1)
-                        # Quiet Accumulation — bắt tích lũy im lặng trước pump
-                        r_qa = score_quiet_accumulation(coin)
-                        if r_qa:
-                            results.append(r_qa)
+                        # ĐÃ TẮT: H1 Vol Spike + Quiet Accumulation
+                        # Chỉ lấy đúng score_intraday_early() để Telegram chỉ có INTRADAY EARLY PUMP.
                 except Exception as e:
                     log.debug(f"Intraday {exchange} {fmap[future]}: {e}")
         log.info(f"✅ Intraday {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
@@ -3777,14 +3818,21 @@ def run_intraday_early_scan() -> list[ScoreResult]:
             except Exception as e:
                 log.error(f"Intraday scan error: {e}")
 
-    # Dedup — giữ bản điểm cao nhất cho mỗi symbol
+    # Dedup — giữ bản điểm cao nhất cho mỗi symbol, ưu tiên TRIPLE CONFIRMED + mới thoát baseline.
+    def _intraday_rank_key(x: ScoreResult):
+        text = (x.signal_type + " " + " ".join(x.details)).upper()
+        is_triple = 1 if "TRIPLE" in text else 0
+        is_smart  = 1 if "SMART MONEY" in text or "BASELINE EARLY" in text else 0
+        baseline_bonus = max(0.0, SMART_BASELINE_EARLY - x.baseline_break_pct) if x.baseline_break_pct > 0 else 0.0
+        return (is_smart, is_triple, x.total_score, baseline_bonus)
+
     seen: dict[str, ScoreResult] = {}
-    for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
+    for r in sorted(all_results, key=_intraday_rank_key, reverse=True):
         base = r.symbol.upper().rstrip("M") if r.symbol.upper().endswith("USDTM") else r.symbol.upper()
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
     log.info(f"⚡ Intraday scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
     return final[:INTRADAY_TOP_N]
 
@@ -3792,7 +3840,7 @@ def run_intraday_early_scan() -> list[ScoreResult]:
 def format_intraday_alert(results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"⚡ <b>INTRADAY EARLY PUMP — {now}</b>\n"]
-    lines.append("🔔 <i>H1 Vol Spike + Intraday pump sớm — alert trước khi nến D đóng</i>\n")
+    lines.append("🔔 <i>Chỉ lọc INTRADAY EARLY PUMP — alert trước khi nến D đóng</i>\n")
 
     def fmt_price(v: float) -> str:
         return f"{v:.6g}" if v > 0 else "-"
@@ -3838,14 +3886,7 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
             + (f"\n{cvd_line}" if cvd_line else "") +
             f"\nFR: <b>{r.fr:.4f}%</b>"
         )
-        if r.entry > 0 and r.tp1 > 0:
-            lines.append(
-                f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>\n"
-                f"📍 Entry chuẩn: <b>{fmt_price(r.entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>\n"
-                f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
-                f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
-                f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
-            )
+     
         if r.entry_note:
             lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
         lines.append("")
@@ -3861,7 +3902,6 @@ def job_intraday_scan():
         if not results:
             log.info("⚡ Intraday scan: không có signal đủ điều kiện.")
             return
-        register_active_trades(results, source="INTRADAY_EARLY")
         msg = format_intraday_alert(results)
         if send_telegram(msg):
             log.info(f"✅ Intraday early alert gửi: {len(results)} signal(s)")
@@ -3918,7 +3958,7 @@ def run_h1_spike_scan() -> list[ScoreResult]:
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
     log.info(f"⚡ H1 spike scan xong {time.time()-scan_start:.1f}s | {len(final)} unique")
     return final[:INTRADAY_TOP_N]
 
@@ -4557,7 +4597,6 @@ def job_reversal_only():
             log.info(f"  {r.reversal_type}: {r.display_symbol} {r.total_score:.1f}đ — {r.signal_type}")
             log.info(f"  1D: {r.price_chg:+.2f}% | 1H: {r.h1_chg:+.2f}%")
 
-        register_active_trades(rev_results, source="REVERSAL_30M")
         msg = format_reversal_alert(rev_results)
         if send_telegram(msg):
             log.info("✅ Reversal alert đã gửi!")
@@ -5269,7 +5308,6 @@ def job():
 
         save_results(pump_results, dump_results, rev_results)
         # Vẫn register để intraday monitor theo dõi, nhưng KHÔNG gửi Telegram 1D scan
-        register_active_trades((pump_results or []) + (dump_results or []) + (rev_results or []), source="HOURLY_SCAN")
         log.info("✅ 1D scan xong — không gửi Telegram (chỉ Intraday Early Pump mới alert).")
 
     except Exception as e:
@@ -5281,331 +5319,7 @@ def job():
 
 
 # ══════════════════════════════════════════════════════════════
-# ACTIVE TRADE MONITOR — CHECK MỖI 30 PHÚT
-# ══════════════════════════════════════════════════════════════
 
-ACTIVE_TRADES_FILE = "active_trades.json"
-MONITOR_INTERVAL_MINUTES = 30
-MONITOR_PRICE_ADVERSE_PCT = 1.5       # Giá đi ngược entry 1.5% thì cảnh báo thoát sớm
-MONITOR_CVD_BARS = 3                  # Dùng 3 nến M30 gần nhất để làm CVD proxy
-MONITOR_CVD_BEARISH_BARS = 2          # LONG: >=2/3 nến signed volume âm = xấu
-MONITOR_CVD_BULLISH_BARS = 2          # SHORT: >=2/3 nến signed volume dương = xấu
-MONITOR_FUNDING_LONG_MAX = 0.08       # LONG: funding > 0.08% = crowded long, xấu
-MONITOR_FUNDING_SHORT_MIN = -0.08     # SHORT: funding < -0.08% = crowded short, xấu
-MONITOR_TP_ALERTS_ENABLED = True        # Bật alert khi chạm TP1/TP2/TP3
-MONITOR_REMOVE_AFTER_TP3 = True         # Chạm TP3 thì kết thúc monitor signal đó để tránh spam
-
-
-def _active_trade_key(exchange: str, symbol: str, side: str) -> str:
-    return f"{exchange}:{symbol}:{side}".upper()
-
-
-def _load_active_trades() -> dict:
-    try:
-        with open(ACTIVE_TRADES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_active_trades(data: dict) -> None:
-    try:
-        with open(ACTIVE_TRADES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning(f"Không lưu được {ACTIVE_TRADES_FILE}: {e}")
-
-
-def _result_side_for_hold(r: ScoreResult) -> str:
-    side = _reversal_side(r) if getattr(r, "reversal_type", "") else ""
-    if side:
-        return side
-    sig = (r.signal_type or r.market_mode or "").upper()
-    if "SHORT" in sig or "DUMP" in sig:
-        return "SHORT"
-    return "LONG"
-
-
-def register_active_trades(results: list[ScoreResult], source: str = "SCAN") -> None:
-    """Lưu signal mới để monitor mỗi 30 phút.
-
-    V7.2: monitor theo Entry Limit Zone, không coi là đang hold khi giá chưa chạm vùng limit.
-    LONG  : chờ giá <= entry_zone_high mới tính FILLED/PnL.
-    SHORT : chờ giá >= entry_zone_low  mới tính FILLED/PnL.
-    """
-    data = _load_active_trades()
-    now = datetime.now(timezone.utc).isoformat()
-    added = 0
-
-    for r in results or []:
-        if not r or r.entry <= 0 or r.sl <= 0:
-            continue
-        side = _result_side_for_hold(r)
-        key = _active_trade_key(r.exchange, r.symbol, side)
-
-        zone_low = float(r.entry_zone_low or r.entry)
-        zone_high = float(r.entry_zone_high or r.entry)
-        if zone_low > zone_high:
-            zone_low, zone_high = zone_high, zone_low
-
-        is_limit_zone = bool(zone_low > 0 and zone_high > 0 and abs(zone_high - zone_low) > 0)
-
-        data[key] = {
-            "symbol": r.symbol,
-            "exchange": r.exchange,
-            "side": side,
-            "entry": float(r.entry),
-            "entry_zone_low": zone_low,
-            "entry_zone_high": zone_high,
-            "entry_mode": "LIMIT_ZONE" if is_limit_zone else "MARKET_OR_SINGLE_ENTRY",
-            "filled": False if is_limit_zone else True,
-            "filled_at": "",
-            "fill_price": 0.0,
-            "sl": float(r.sl),
-            "tp1": float(r.tp1),
-            "tp2": float(r.tp2),
-            "tp3": float(r.tp3),
-            "score": float(r.total_score),
-            "source": source,
-            "created_at": now,
-            "last_check": "",
-            "last_status": "WAITING_LIMIT" if is_limit_zone else "FILLED",
-            "exit_alerted": False,
-            "tp1_alerted": False,
-            "tp2_alerted": False,
-            "tp3_alerted": False,
-            "tp_hit_max": 0,
-        }
-        added += 1
-
-    if added:
-        _save_active_trades(data)
-        log.info(f"📌 Đã đưa {added} signal vào active_trades để monitor 30 phút/lần.")
-
-
-def _signed_cvd_proxy(candles: list, bars: int = MONITOR_CVD_BARS) -> tuple[float, int, int]:
-    """Proxy CVD bằng signed volume M30: nến xanh +vol, nến đỏ -vol."""
-    if not candles:
-        return 0.0, 0, 0
-    recent = candles[-bars:]
-    cvd = 0.0
-    bull = bear = 0
-    for c in recent:
-        o = float(c.get("o", 0)); cl = float(c.get("c", 0)); v = float(c.get("v", 0))
-        if cl >= o:
-            cvd += v; bull += 1
-        else:
-            cvd -= v; bear += 1
-    return cvd, bull, bear
-
-
-def _fmt_pct_value(v: float) -> str:
-    return f"{v:+.2f}%"
-
-
-def monitor_active_trades() -> None:
-    """
-    Job riêng chạy mỗi 30 phút.
-
-    V7.2 — Monitor theo limit zone:
-    - LONG: nếu giá vẫn nằm trên Buy Limit Zone => WAITING RETRACE, chưa tính PnL / chưa báo lỗ.
-    - SHORT: nếu giá vẫn nằm dưới Sell Limit Zone => WAITING RETRACE, chưa tính PnL / chưa báo lỗ.
-    - Chỉ khi giá đã chạm zone mới chuyển FILLED và bắt đầu kiểm tra SL/adverse/CVD/funding.
-    """
-    data = _load_active_trades()
-    if not data:
-        log.info("👁️ Monitor: không có coin đang hold/waiting.")
-        return
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    exit_blocks = []
-    status_blocks = []
-    tp_blocks = []
-    changed = False
-
-    def _fmt(v: float) -> str:
-        return f"{v:.6g}" if v and v > 0 else "-"
-
-    for key, t in list(data.items()):
-        if t.get("exit_alerted"):
-            continue
-
-        symbol = t.get("symbol")
-        exchange = t.get("exchange")
-        side = t.get("side", "LONG")
-        entry = float(t.get("entry", 0) or 0)
-        zone_low = float(t.get("entry_zone_low", entry) or entry)
-        zone_high = float(t.get("entry_zone_high", entry) or entry)
-        if zone_low > zone_high:
-            zone_low, zone_high = zone_high, zone_low
-        sl = float(t.get("sl", 0) or 0)
-        tp1 = float(t.get("tp1", 0) or 0)
-        tp2 = float(t.get("tp2", 0) or 0)
-        tp3 = float(t.get("tp3", 0) or 0)
-        filled = bool(t.get("filled", False))
-
-        if not symbol or not exchange or entry <= 0:
-            continue
-
-        try:
-            candles = get_ohlcv_m30(exchange, symbol, limit=8) or []
-            if not candles:
-                continue
-            last = candles[-1]
-            price = float(last.get("c", 0))
-            bar_high = float(last.get("h", price) or price)
-            bar_low = float(last.get("l", price) or price)
-            if price <= 0:
-                continue
-
-            funding = get_funding_rate(exchange, symbol) or 0.0
-            funding_pct = funding * 100
-            cvd_proxy, bull_bars, bear_bars = _signed_cvd_proxy(candles, MONITOR_CVD_BARS)
-
-            # ── LIMIT ZONE STATE MACHINE ────────────────────────
-            # LONG  waiting khi giá còn cao hơn cạnh trên buy zone.
-            # SHORT waiting khi giá còn thấp hơn cạnh dưới sell zone.
-            waiting_limit = False
-            just_filled = False
-
-            if side == "LONG":
-                if not filled and price > zone_high:
-                    waiting_limit = True
-                elif not filled and price <= zone_high:
-                    filled = True
-                    just_filled = True
-            else:
-                if not filled and price < zone_low:
-                    waiting_limit = True
-                elif not filled and price >= zone_low:
-                    filled = True
-                    just_filled = True
-
-            t["last_check"] = datetime.now(timezone.utc).isoformat()
-            t["last_price"] = price
-
-            if waiting_limit:
-                t["last_status"] = "WAITING_LIMIT"
-                t["last_pnl_pct"] = 0.0
-                changed = True
-                # Không gửi Telegram mỗi lần để tránh spam; chỉ log trạng thái.
-                side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
-                log.info(
-                    f"👁️ Monitor WAITING {symbol} {exchange} {side}: "
-                    f"price={price:.6g}, zone={zone_low:.6g}->{zone_high:.6g}"
-                )
-                continue
-
-            if just_filled:
-                t["filled"] = True
-                t["filled_at"] = datetime.now(timezone.utc).isoformat()
-                t["fill_price"] = entry
-                t["last_status"] = "FILLED"
-                changed = True
-                side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
-                status_blocks.append(
-                    f"✅ <b>LIMIT FILLED</b>\n"
-                    f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
-                    f"Zone: <b>{_fmt(zone_low)} → {_fmt(zone_high)}</b>\n"
-                    f"Entry chuẩn: <b>{_fmt(entry)}</b> | Giá hiện tại: <b>{_fmt(price)}</b>"
-                )
-
-            # Từ đây mới tính PnL vì lệnh đã được xem là filled.
-            pnl_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
-            t["last_pnl_pct"] = pnl_pct
-            changed = True
-
-            # ── TP ALERTS: chỉ báo 1 lần cho từng mốc TP sau khi đã FILLED ─────────
-            if MONITOR_TP_ALERTS_ENABLED:
-                tp_hits = []
-                if side == "LONG":
-                    if tp1 > 0 and bar_high >= tp1 and not t.get("tp1_alerted", False):
-                        tp_hits.append((1, tp1, "TP1 HIT — có thể chốt 30–50%, dời SL về entry"))
-                    if tp2 > 0 and bar_high >= tp2 and not t.get("tp2_alerted", False):
-                        tp_hits.append((2, tp2, "TP2 HIT — chốt thêm, giữ phần còn lại"))
-                    if tp3 > 0 and bar_high >= tp3 and not t.get("tp3_alerted", False):
-                        tp_hits.append((3, tp3, "TP3 HIT — đạt full target"))
-                else:
-                    if tp1 > 0 and bar_low <= tp1 and not t.get("tp1_alerted", False):
-                        tp_hits.append((1, tp1, "TP1 HIT — có thể chốt 30–50%, dời SL về entry"))
-                    if tp2 > 0 and bar_low <= tp2 and not t.get("tp2_alerted", False):
-                        tp_hits.append((2, tp2, "TP2 HIT — chốt thêm, giữ phần còn lại"))
-                    if tp3 > 0 and bar_low <= tp3 and not t.get("tp3_alerted", False):
-                        tp_hits.append((3, tp3, "TP3 HIT — đạt full target"))
-
-                if tp_hits:
-                    side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
-                    hit_lines = []
-                    for n, tp_price, note in tp_hits:
-                        t[f"tp{n}_alerted"] = True
-                        t["tp_hit_max"] = max(int(t.get("tp_hit_max", 0) or 0), n)
-                        hit_pct = (tp_price - entry) / entry * 100 if side == "LONG" else (entry - tp_price) / entry * 100
-                        hit_lines.append(f"🎯 <b>TP{n}: {_fmt(tp_price)}</b> ({hit_pct:+.2f}%) — {html.escape(note)}")
-
-                    if MONITOR_REMOVE_AFTER_TP3 and t.get("tp3_alerted", False):
-                        t["exit_alerted"] = True
-                        t["last_status"] = "TP3_DONE"
-
-                    changed = True
-                    tp_blocks.append(
-                        f"🎯 <b>TAKE PROFIT HIT</b>\n"
-                        f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
-                        f"Entry: <b>{_fmt(entry)}</b> | Giá hiện tại: <b>{_fmt(price)}</b>\n"
-                        + "\n".join(hit_lines)
-                    )
-
-            reasons = []
-            if side == "LONG":
-                if sl > 0 and price <= sl:
-                    reasons.append("giá chạm/vượt SL")
-                if price <= entry * (1 - MONITOR_PRICE_ADVERSE_PCT / 100):
-                    reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
-                if bear_bars >= MONITOR_CVD_BEARISH_BARS and cvd_proxy < 0:
-                    reasons.append("CVD M30 proxy xấu")
-                if funding_pct >= MONITOR_FUNDING_LONG_MAX:
-                    reasons.append(f"funding quá dương {funding_pct:.4f}%")
-            else:
-                if sl > 0 and price >= sl:
-                    reasons.append("giá chạm/vượt SL")
-                if price >= entry * (1 + MONITOR_PRICE_ADVERSE_PCT / 100):
-                    reasons.append(f"giá đi ngược entry {abs((price-entry)/entry*100):.2f}%")
-                if bull_bars >= MONITOR_CVD_BULLISH_BARS and cvd_proxy > 0:
-                    reasons.append("CVD M30 proxy xấu")
-                if funding_pct <= MONITOR_FUNDING_SHORT_MIN:
-                    reasons.append(f"funding quá âm {funding_pct:.4f}%")
-
-            if reasons:
-                t["exit_alerted"] = True
-                t["last_status"] = "EXIT_ALERTED"
-                changed = True
-                side_icon = "🟢 LONG" if side == "LONG" else "🔻 SHORT"
-                exit_blocks.append(
-                    f"🚨 <b>THOÁT NGAY</b>\n"
-                    f"<b>{html.escape(symbol)} · {html.escape(exchange)}</b> | {side_icon}\n"
-                    f"Zone: <b>{_fmt(zone_low)} → {_fmt(zone_high)}</b>\n"
-                    f"Entry: <b>{_fmt(entry)}</b> | Giá: <b>{_fmt(price)}</b> | PnL: <b>{pnl_pct:+.2f}%</b>\n"
-                    f"SL: <b>{_fmt(sl)}</b> | Funding: <b>{funding_pct:.4f}%</b>\n"
-                    f"Lý do: {html.escape(', '.join(reasons))}"
-                )
-        except Exception as e:
-            log.debug(f"Monitor lỗi {key}: {e}")
-
-    if changed:
-        _save_active_trades(data)
-
-    blocks = status_blocks + exit_blocks
-    if blocks:
-        msg = f"👁️ <b>MONITOR 30M — {now}</b>\n\n" + "\n\n".join(blocks)
-        if send_telegram(msg):
-            log.info(f"👁️ Monitor gửi alert: filled={len(status_blocks)}, exit={len(exit_blocks)}")
-        else:
-            log.error("❌ Monitor gửi alert thất bại")
-    else:
-        log.info("👁️ Monitor: chưa có fill/deterioration.")
-
-
-# ══════════════════════════════════════════════════════════════
 # H2 GEM SCAN — quét mỗi 2 tiếng, tìm coin pump/squeeze sớm
 # ══════════════════════════════════════════════════════════════
 
@@ -5648,7 +5362,7 @@ def run_h2_scan() -> list[ScoreResult]:
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
     log.info(f"🕐 H2 scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
     return final[:H2_SCAN_TOP_N]
 
@@ -5833,8 +5547,8 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        log.info("🧪 Chạy test ngay...")
-        job()
+        log.info("🧪 Chạy Intraday Early Pump scan ngay và gửi Telegram nếu có signal...")
+        job_intraday_scan()
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-one":
         if len(sys.argv) < 3:
@@ -5878,9 +5592,8 @@ if __name__ == "__main__":
             return dt.strftime("%Y%m%d%H%M")
 
         log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:02 UTC → Full 1D scan (log only) + H1 Vol Spike scan → Telegram")
-        log.info("   xx:02 giờ chẵn UTC → H2 Gem Scan mỗi 2 tiếng → Telegram")
         log.info("   xx:17 / xx:47 UTC → Intraday Early Pump scan → Telegram")
+        log.info("   --now → chạy Intraday Early Pump scan ngay")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
         last_full_slot    = ""
@@ -5891,46 +5604,8 @@ if __name__ == "__main__":
             now = datetime.now(timezone.utc)
             current_slot = slot_id(now)
 
-            # xx:02 UTC — Full 1D scan (log only) + H1 Vol Spike (Telegram)
-            # H2 Gem Scan chạy thêm nếu là giờ chẵn
-            if now.minute == FULL_SCAN_MINUTE and current_slot != last_full_slot:
-                last_full_slot = current_slot
-
-                # 1. Full 1D scan — log only
-                try:
-                    log.info(f"🚀 [{now.strftime('%H:%M:%S UTC')}] Full 1D scan...")
-                    job()
-                except Exception as e:
-                    log.error(f"Scheduler hourly error: {e}", exc_info=True)
-                    try:
-                        send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
-                    except Exception:
-                        pass
-
-                # 2. H1 Vol Spike scan — Telegram mỗi giờ
-                try:
-                    log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] H1 Vol Spike scan...")
-                    job_h1_spike_scan()
-                except Exception as e:
-                    log.error(f"H1 spike error: {e}", exc_info=True)
-                    try:
-                        send_telegram(f"❌ [h1spike] error: {html.escape(str(e))}")
-                    except Exception:
-                        pass
-
-                # 3. H2 Gem Scan — Telegram mỗi 2 tiếng (giờ chẵn)
-                h2_slot_id = f"{now.year}{now.month:02d}{now.day:02d}{now.hour:02d}_h2"
-                if now.hour % 2 == 0 and h2_slot_id != last_h2_slot:
-                    last_h2_slot = h2_slot_id
-                    try:
-                        log.info(f"🕐 [{now.strftime('%H:%M:%S UTC')}] H2 Gem scan...")
-                        job_h2_scan()
-                    except Exception as e:
-                        log.error(f"H2 scan error: {e}", exc_info=True)
-                        try:
-                            send_telegram(f"❌ [h2scan] error: {html.escape(str(e))}")
-                        except Exception:
-                            pass
+            # ĐÃ TẮT: Full 1D / H1 Spike / H2 Gem Telegram
+            # Bot chỉ gửi Telegram khi có INTRADAY EARLY PUMP tại xx:17 / xx:47 UTC.
 
             # Intraday early scan — chạy tại xx:17 và xx:47 UTC
             if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
@@ -5949,8 +5624,7 @@ if __name__ == "__main__":
             if now.second < CHECK_SLEEP:
                 next_full_h = now.hour if now.minute < FULL_SCAN_MINUTE else (now.hour + 1) % 24
                 log.info(
-                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Full: {next_full_h:02d}:{FULL_SCAN_MINUTE:02d} UTC | "
-                    f"Monitor: xx:17 / xx:47"
+                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Intraday Early Pump: xx:17 / xx:47 UTC"
                 )
 
             # Poll Telegram commands
