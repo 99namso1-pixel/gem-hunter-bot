@@ -182,6 +182,16 @@ H1_EARLY_MIN_CHG        = 2.5    # H1 tăng >= 2.5% (thấp để bắt sớm)
 H1_EARLY_OI_MIN         = 5.0    # OI spike 1 nến >= 5%
 H1_EARLY_MIN_SCORE      = 4.0    # Score tối thiểu để lọt
 
+# ── Quiet Accumulation Detector — bắt tích lũy im lặng trước pump ────────────
+# Vol thấp + giá đứng yên NHƯNG OI Delta tăng đột biến = smart money đang vào.
+# Case HEI 28/5: vol 0.4x MA10 + giá +1.15% nhưng OI Delta bắt đầu tăng → pump tiếp theo +96%.
+ENABLE_QUIET_ACCUM      = True
+QUIET_ACCUM_MAX_VOL     = 1.2    # Vol <= 1.2x MA10 (im lặng)
+QUIET_ACCUM_MAX_CHG     = 5.0    # Giá thay đổi <= 5% (không pump rõ)
+QUIET_ACCUM_OI_DELTA    = 3.0    # OI Delta tăng >= 3x so với trung bình (đột biến)
+QUIET_ACCUM_FR_MAX      = 0.02   # FR không quá dương (không phải long trap)
+QUIET_ACCUM_MIN_SCORE   = 4.0    # Score tối thiểu
+
 # ── Intraday Early Detection — bắt pump đang hình thành trong nến D ────────
 # Mục tiêu: alert sớm khi coin đang pump mạnh TRONG ngày, không cần đợi nến D đóng.
 # Trigger khi nến 1D live đã tăng >= ngưỡng từ open, vol đủ mạnh, FR âm.
@@ -278,6 +288,8 @@ class CoinData:
     oi_prev4: float = 0
     oi_change_pct: float = 0       # OI thay đổi so với 4 nến trước (trend dài)
     oi_spike_pct: float = 0        # OI thay đổi so với nến LIỀN TRƯỚC (đột biến ngắn hạn)
+    oi_delta: float = 0            # OI Delta tuyệt đối (net tiền vào/ra) nến hiện tại
+    oi_delta_avg: float = 0        # OI Delta trung bình 5 nến trước (baseline)
     # Funding Rate
     funding_rate: float = 0
     # Long/Short Ratio
@@ -1177,17 +1189,25 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
     coin.funding_rate = fr if fr is not None else 0
     # Không sleep ở đây: bản FAST dùng ThreadPool + timeout ngắn
 
-    oi_hist = get_oi_history(exchange, symbol, limit=6)
+    oi_hist = get_oi_history(exchange, symbol, limit=8)
     if oi_hist and len(oi_hist) >= 5:
         coin.oi_current = float(oi_hist[-1].get("openInterest", 0))
         coin.oi_prev4   = float(oi_hist[-5].get("openInterest", 0))
         if coin.oi_prev4 > 0:
             coin.oi_change_pct = (coin.oi_current - coin.oi_prev4) / coin.oi_prev4 * 100
-        # OI spike: so với nến liền trước (1 kỳ) — bắt đột biến ngắn hạn
+        # OI spike: so với nến liền trước
         if len(oi_hist) >= 2:
             oi_prev1 = float(oi_hist[-2].get("openInterest", 0))
             if oi_prev1 > 0:
                 coin.oi_spike_pct = (coin.oi_current - oi_prev1) / oi_prev1 * 100
+        # OI Delta: net change tuyệt đối nến hiện tại
+        if len(oi_hist) >= 2:
+            coin.oi_delta = coin.oi_current - float(oi_hist[-2].get("openInterest", 0))
+        # OI Delta avg: trung bình delta 5 nến trước làm baseline
+        if len(oi_hist) >= 7:
+            deltas = [abs(float(oi_hist[i].get("openInterest", 0)) - float(oi_hist[i-1].get("openInterest", 0)))
+                      for i in range(-6, -1)]
+            coin.oi_delta_avg = sum(deltas) / len(deltas) if deltas else 0
     # Không sleep ở đây: bản FAST dùng ThreadPool + timeout ngắn
 
     lsr = get_lsr(exchange, symbol)
@@ -2527,8 +2547,18 @@ def score_h1_breakout(coin: CoinData) -> Optional[ScoreResult]:
 def calc_h2_tp_sl(result: ScoreResult, h2_high: float, h2_low: float,
                    h2_close: float, direction: str) -> None:
     """
-    TP/SL ngắn hạn cho H2 — target 15-30%.
-    TP1 = range*0.5, TP2 = range*1.0, TP3 = range*1.5
+    TP động theo LỰC — score càng cao thì TP càng xa.
+
+    Thang lực dựa trên total_score:
+      Score < 6  → TP3 ~30%   (tín hiệu yếu, scalp)
+      Score 6–9  → TP3 ~60%   (tín hiệu trung bình)
+      Score 9–12 → TP3 ~120%  (tín hiệu mạnh)
+      Score 12–15→ TP3 ~200%  (tín hiệu rất mạnh)
+      Score 15+  → TP3 ~300%  (gem coin kiểu ALLO)
+
+    TP1 = target bảo thủ (chốt lời nhanh)
+    TP2 = target chính
+    TP3 = target dài hạn theo đà lực
     """
     import math
     h2_range = h2_high - h2_low
@@ -2540,26 +2570,44 @@ def calc_h2_tp_sl(result: ScoreResult, h2_high: float, h2_low: float,
         digits = max(2, -int(math.floor(math.log10(abs(v)))) + 3)
         return round(v, digits)
 
-    entry = h2_close
+    entry  = h2_close
+    score  = getattr(result, "total_score", 0) or 0
     result.entry = fmt(entry)
 
+    # Xác định multiplier theo lực (score)
+    if score >= 15:
+        tp1_pct, tp2_pct, tp3_pct = 0.30, 1.00, 3.00   # +30% / +100% / +300%
+        label = "💎 GEM FORCE"
+    elif score >= 12:
+        tp1_pct, tp2_pct, tp3_pct = 0.25, 0.70, 2.00   # +25% / +70% / +200%
+        label = "🔥 CỰC MẠNH"
+    elif score >= 9:
+        tp1_pct, tp2_pct, tp3_pct = 0.18, 0.45, 1.20   # +18% / +45% / +120%
+        label = "💥 MẠNH"
+    elif score >= 6:
+        tp1_pct, tp2_pct, tp3_pct = 0.12, 0.30, 0.60   # +12% / +30% / +60%
+        label = "📈 TRUNG BÌNH"
+    else:
+        tp1_pct, tp2_pct, tp3_pct = 0.08, 0.18, 0.30   # +8% / +18% / +30%
+        label = "📊 YẾU"
+
+    result.market_mode = f"{result.market_mode} [{label}]" if hasattr(result, "market_mode") and result.market_mode else label
+
     if direction == "PUMP":
-        result.sl  = fmt(h2_low  - h2_range * 0.15)   # SL chặt hơn D
-        result.tp1 = fmt(entry   + h2_range * 0.5)     # ~10-15%
-        result.tp2 = fmt(entry   + h2_range * 1.0)     # ~20-30%
-        result.tp3 = fmt(entry   + h2_range * 1.5)     # ~35-45%
+        result.sl  = fmt(h2_low - h2_range * 0.15)
+        result.tp1 = fmt(entry * (1 + tp1_pct))
+        result.tp2 = fmt(entry * (1 + tp2_pct))
+        result.tp3 = fmt(entry * (1 + tp3_pct))
     else:  # DUMP
         result.sl  = fmt(h2_high + h2_range * 0.15)
-        result.tp1 = fmt(entry   - h2_range * 0.5)
-        result.tp2 = fmt(entry   - h2_range * 1.0)
-        result.tp3 = fmt(entry   - h2_range * 1.5)
+        result.tp1 = fmt(entry * (1 - tp1_pct))
+        result.tp2 = fmt(entry * (1 - tp2_pct))
+        result.tp3 = fmt(entry * (1 - tp3_pct))
 
     risk = abs(entry - result.sl)
-    reward1 = abs(result.tp1 - entry)
-    reward2 = abs(result.tp2 - entry)
     if risk > 0:
-        result.rr_tp1 = round(reward1 / risk, 1)
-        result.rr_tp2 = round(reward2 / risk, 1)
+        result.rr_tp1 = round(abs(result.tp1 - entry) / risk, 1)
+        result.rr_tp2 = round(abs(result.tp2 - entry) / risk, 1)
 
 
 def score_coin_h2(exchange: str, symbol: str) -> Optional[ScoreResult]:
@@ -2649,13 +2697,38 @@ def score_coin_h2(exchange: str, symbol: str) -> Optional[ScoreResult]:
         elif vol_ratio >= H2_MIN_VOL:
             score += 1.0; details.append(f"📊 Vol H2 tăng ({vol_ratio:.1f}x)")
 
-        # 3. OI
-        if oi_chg >= 20 and oi_chg > abs(h2_chg):
-            score += 2.0; details.append(f"📡 OI +{oi_chg:.1f}% — long mới vào mạnh")
+        # 3. OI DELTA — yếu tố chính (max 4đ)
+        oi_hist_full = get_oi_history(exchange, symbol, limit=8)
+        oi_delta_val = 0.0
+        oi_delta_r   = 0.0
+        oi_spike_pct = 0.0
+        if oi_hist_full and len(oi_hist_full) >= 7:
+            oi_cur  = float(oi_hist_full[-1].get("openInterest", 0))
+            oi_prev = float(oi_hist_full[-2].get("openInterest", oi_cur))
+            oi_delta_val = oi_cur - oi_prev
+            if oi_prev > 0:
+                oi_spike_pct = (oi_cur - oi_prev) / oi_prev * 100
+            deltas = [abs(float(oi_hist_full[i].get("openInterest", 0)) - float(oi_hist_full[i-1].get("openInterest", 0)))
+                      for i in range(-6, -1)]
+            avg_delta = sum(deltas) / len(deltas) if deltas else 0
+            if avg_delta > 0:
+                oi_delta_r = abs(oi_delta_val) / avg_delta
+
+        if oi_delta_val > 0:
+            if oi_delta_r >= 8:
+                score += 4.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
+            elif oi_delta_r >= 5:
+                score += 3.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline")
+            elif oi_delta_r >= 2.5:
+                score += 2.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline")
+            else:
+                score += 1.0; details.append(f"📡 OI Delta tăng")
+        if oi_spike_pct >= 20:
+            score += 2.0; details.append(f"🔥 %OI spike {oi_spike_pct:.1f}%")
+        elif oi_spike_pct >= 10:
+            score += 1.0; details.append(f"📡 %OI +{oi_spike_pct:.1f}%")
         elif oi_chg >= 10:
-            score += 1.0; details.append(f"📡 OI +{oi_chg:.1f}%")
-        elif oi_chg <= -5:
-            score += 1.0; details.append(f"📡 OI -{abs(oi_chg):.1f}% — short cover")
+            score += 0.5; details.append(f"📡 OI trend +{oi_chg:.1f}%")
 
         # 4. FR âm = short squeeze fuel
         if fr_pct <= -0.3:
@@ -2937,24 +3010,26 @@ def scan_one_symbol(exchange: str, symbol: str) -> tuple[
 
 def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     """
-    Intraday Early Detection — bắt pump đang hình thành trong nến D LIVE.
+    Intraday Early Detection — OI Delta là yếu tố chính.
 
-    Không cần đợi nến D đóng. Trigger khi:
-      • Nến D live đã tăng >= INTRADAY_EARLY_MIN_CHG% từ open
-      • Vol >= INTRADAY_EARLY_MIN_VOL x MA10
-      • Bonus: FR âm sâu, OI tăng mạnh, H1 cùng chiều
+    Thứ tự ưu tiên:
+      1. OI Delta tuyệt đối tăng mạnh (tiền mới thực sự vào)
+      2. %OI spike (tốc độ tăng OI)
+      3. Giá tăng theo OI (xác nhận lực mua)
+      4. Vol spike (xác nhận thanh khoản)
+      5. FR âm (squeeze fuel)
     """
     if not ENABLE_INTRADAY_EARLY:
         return None
     if coin.open <= 0 or coin.vol_ma10 <= 0:
         return None
 
-    # Tính % tăng từ open đến close hiện tại (live candle)
     intraday_chg = (coin.close - coin.open) / coin.open * 100 if coin.open > 0 else 0
     vol_ratio    = coin.volume / coin.vol_ma10 if coin.vol_ma10 > 0 else 0
     fr_pct       = coin.funding_rate * 100
+    oi_delta_r   = abs(coin.oi_delta) / coin.oi_delta_avg if coin.oi_delta_avg > 0 else 0
 
-    # Filter cứng — cần đủ cả chg lẫn vol để tránh noise
+    # Filter cứng
     if intraday_chg < INTRADAY_EARLY_MIN_CHG:
         return None
     if vol_ratio < INTRADAY_EARLY_MIN_VOL:
@@ -2973,57 +3048,62 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
 
     score   = 0.0
     details = []
-
     details.append(f"⚡ Intraday Pump: open {coin.open:.6g} → now {coin.close:.6g} (+{intraday_chg:.1f}%)")
 
-    # Momentum intraday
+    # ── 1. OI DELTA — yếu tố chính (max 5đ) ──────────────────────────────
+    if coin.oi_delta > 0:
+        if oi_delta_r >= 10:
+            score += 5.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
+        elif oi_delta_r >= 6:
+            score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline — rất mạnh")
+        elif oi_delta_r >= 3:
+            score += 3.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline — mạnh")
+        else:
+            score += 1.5; details.append(f"📡 OI Delta tăng (x{oi_delta_r:.1f})")
+    else:
+        details.append("⚠️ OI Delta âm — không có tiền mới vào")
+
+    # ── 2. %OI SPIKE — tốc độ tăng (max 4đ) ─────────────────────────────
+    if coin.oi_spike_pct >= 40:
+        score += 4.0; details.append(f"🔥 %OI spike {coin.oi_spike_pct:.1f}% — đột biến cực mạnh")
+    elif coin.oi_spike_pct >= 25:
+        score += 3.0; details.append(f"💥 %OI spike {coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 15:
+        score += 2.0; details.append(f"📡 %OI tăng mạnh {coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 8:
+        score += 1.0; details.append(f"📡 %OI tăng {coin.oi_spike_pct:.1f}%")
+
+    # ── 3. GIÁ TĂNG THEO OI — xác nhận (max 3đ) ─────────────────────────
     if intraday_chg >= 40:
-        score += 3.0; details.append(f"🔥 Pump cực mạnh trong ngày (+{intraday_chg:.1f}%)")
+        score += 3.0; details.append(f"🔥 Giá +{intraday_chg:.1f}% theo OI — cực mạnh")
     elif intraday_chg >= 25:
-        score += 2.0; details.append(f"💪 Pump rất mạnh (+{intraday_chg:.1f}%)")
+        score += 2.5; details.append(f"💪 Giá +{intraday_chg:.1f}% theo OI")
+    elif intraday_chg >= 15:
+        score += 2.0; details.append(f"📈 Giá +{intraday_chg:.1f}% theo OI")
     else:
-        score += 1.0; details.append(f"📈 Pump trong ngày (+{intraday_chg:.1f}%)")
+        score += 1.0; details.append(f"📈 Giá +{intraday_chg:.1f}%")
 
-    # Vol spike — xác nhận dòng tiền thật
+    # ── 4. VOL SPIKE — thanh khoản (max 2đ) ──────────────────────────────
     if vol_ratio >= 8:
-        score += 3.0; details.append(f"💥 Vol spike cực mạnh ({vol_ratio:.1f}x MA10)")
+        score += 2.0; details.append(f"💥 Vol {vol_ratio:.1f}x MA10")
     elif vol_ratio >= 5:
-        score += 2.0; details.append(f"💥 Vol spike mạnh ({vol_ratio:.1f}x MA10)")
+        score += 1.5; details.append(f"📊 Vol {vol_ratio:.1f}x MA10")
     else:
-        score += 1.0; details.append(f"📊 Vol tăng ({vol_ratio:.1f}x MA10)")
+        score += 0.8; details.append(f"📊 Vol {vol_ratio:.1f}x MA10")
 
-    # Funding âm = squeeze fuel
+    # ── 5. FR ÂM — squeeze fuel (max 2đ) ─────────────────────────────────
     if fr_pct <= -0.5:
-        score += 3.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%) — short squeeze mạnh")
-    elif fr_pct <= INTRADAY_EARLY_FR_DEEP:
-        score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%) — squeeze fuel")
-    elif fr_pct <= -0.05:
+        score += 2.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%)")
+    elif fr_pct <= -0.1:
+        score += 1.5; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%)")
+    elif fr_pct <= -0.02:
         score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
 
-    # OI tăng = dòng tiền mới vào, không phải short cover thuần
-    if coin.oi_change_pct >= INTRADAY_EARLY_OI_MIN * 2:
-        score += 2.0; details.append(f"📡 OI tăng mạnh (+{coin.oi_change_pct:.1f}%) — long thật vào")
-    elif coin.oi_change_pct >= INTRADAY_EARLY_OI_MIN:
-        score += 1.0; details.append(f"📡 OI tăng ({coin.oi_change_pct:.1f}%)")
-
-    # OI spike 1 nến — đột biến Aggregated OI ngay trong nến đang chạy
-    # Case HANA: OI 10.6M → 13.6M (+28%) đúng lúc pump = tín hiệu mạnh nhất
-    if coin.oi_spike_pct >= 30:
-        score += 3.0; details.append(f"🚀 OI spike đột biến: +{coin.oi_spike_pct:.1f}% — tiền mới vào CỰC MẠNH")
-    elif coin.oi_spike_pct >= 20:
-        score += 2.0; details.append(f"💥 OI spike 1 nến: +{coin.oi_spike_pct:.1f}%")
-    elif coin.oi_spike_pct >= 12:
-        score += 1.0; details.append(f"📡 OI tăng đột biến: +{coin.oi_spike_pct:.1f}%")
-
-    # H1 cùng chiều = momentum vẫn đang chạy
+    # ── Bonus phụ ─────────────────────────────────────────────────────────
     if coin.h1_available and coin.h1_price_change_pct >= 3:
-        score += 1.5; details.append(f"✅ H1 xác nhận (+{coin.h1_price_change_pct:.1f}%) — pump đang tiếp diễn")
-    elif coin.h1_available and coin.h1_price_change_pct >= 1:
-        score += 0.5; details.append(f"➡️ H1 tích cực (+{coin.h1_price_change_pct:.1f}%)")
-
-    # Liq: shorts bị thanh lý = cascade up
+        score += 1.0; details.append(f"✅ H1 xác nhận (+{coin.h1_price_change_pct:.1f}%)")
     if coin.liq_ratio >= 3:
-        score += 1.5; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x — cascade")
+        score += 1.0; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x")
     elif coin.liq_ratio >= 1.5:
         score += 0.5; details.append(f"✅ Shorts liq {coin.liq_ratio:.1f}x")
 
@@ -3033,10 +3113,9 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < INTRADAY_EARLY_MIN_SCORE:
         return None
 
-    # Signal label
-    if score >= 10:
-        result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (MUA SỚM)"
-    elif score >= 7:
+    if score >= 12:
+        result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (OI Delta bùng nổ)"
+    elif score >= 8:
         result.signal_type = "⚡🚀 INTRADAY PUMP — RẤT MẠNH"
     elif score >= 5:
         result.signal_type = "⚡📈 INTRADAY PUMP ĐANG HÌNH THÀNH"
@@ -3157,53 +3236,59 @@ def score_h1_vol_spike(coin: CoinData) -> Optional["ScoreResult"]:
 
     details.append(f"⚡ H1 Vol Spike: {coin.h1_open:.6g} → {coin.h1_close:.6g} (+{h1_chg:.2f}%)")
 
-    # Vol spike — chỉ số quan trọng nhất
-    if h1_vol_r >= 8:
-        score += 3.5; details.append(f"💥 Vol H1 cực mạnh: {h1_vol_r:.1f}x MA10")
-    elif h1_vol_r >= 5:
-        score += 2.5; details.append(f"💥 Vol H1 mạnh: {h1_vol_r:.1f}x MA10")
-    else:
-        score += 1.5; details.append(f"📊 Vol H1 spike: {h1_vol_r:.1f}x MA10")
+    oi_delta_r = abs(coin.oi_delta) / coin.oi_delta_avg if coin.oi_delta_avg > 0 else 0
 
-    # H1 price change
-    if h1_chg >= 8:
-        score += 2.5; details.append(f"🚀 H1 pump mạnh: +{h1_chg:.2f}%")
-    elif h1_chg >= 5:
-        score += 1.5; details.append(f"📈 H1 pump: +{h1_chg:.2f}%")
-    else:
-        score += 0.8; details.append(f"📈 H1 tăng: +{h1_chg:.2f}%")
+    # ── 1. OI DELTA — yếu tố chính (max 5đ) ──────────────────────────────
+    if coin.oi_delta > 0:
+        if oi_delta_r >= 10:
+            score += 5.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
+        elif oi_delta_r >= 6:
+            score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline")
+        elif oi_delta_r >= 3:
+            score += 3.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline")
+        else:
+            score += 1.5; details.append(f"📡 OI Delta tăng (x{oi_delta_r:.1f})")
 
-    # OI spike 1 nến
-    if coin.oi_spike_pct >= 20:
-        score += 2.5; details.append(f"🚀 OI spike: +{coin.oi_spike_pct:.1f}% — tiền mới vào mạnh")
+    # ── 2. %OI SPIKE — tốc độ tăng (max 4đ) ─────────────────────────────
+    if coin.oi_spike_pct >= 30:
+        score += 4.0; details.append(f"🔥 %OI spike {coin.oi_spike_pct:.1f}% — cực mạnh")
+    elif coin.oi_spike_pct >= 20:
+        score += 3.0; details.append(f"💥 %OI spike {coin.oi_spike_pct:.1f}%")
     elif coin.oi_spike_pct >= 10:
-        score += 1.5; details.append(f"💥 OI spike: +{coin.oi_spike_pct:.1f}%")
+        score += 2.0; details.append(f"📡 %OI tăng {coin.oi_spike_pct:.1f}%")
     else:
-        score += 0.8; details.append(f"📡 OI tăng: +{coin.oi_spike_pct:.1f}%")
+        score += 0.8; details.append(f"📡 %OI {coin.oi_spike_pct:.1f}%")
 
-    # FR âm = squeeze fuel bonus
+    # ── 3. GIÁ H1 TĂNG THEO OI (max 3đ) ─────────────────────────────────
+    if h1_chg >= 8:
+        score += 3.0; details.append(f"🚀 H1 +{h1_chg:.2f}% theo OI — cực mạnh")
+    elif h1_chg >= 5:
+        score += 2.0; details.append(f"📈 H1 +{h1_chg:.2f}% theo OI")
+    else:
+        score += 1.0; details.append(f"📈 H1 +{h1_chg:.2f}%")
+
+    # ── 4. VOL H1 (max 2đ) ───────────────────────────────────────────────
+    if h1_vol_r >= 8:
+        score += 2.0; details.append(f"💥 Vol H1 {h1_vol_r:.1f}x MA10")
+    elif h1_vol_r >= 5:
+        score += 1.5; details.append(f"📊 Vol H1 {h1_vol_r:.1f}x MA10")
+    else:
+        score += 0.8; details.append(f"📊 Vol H1 {h1_vol_r:.1f}x MA10")
+
+    # ── 5. FR + Bonus ─────────────────────────────────────────────────────
     if fr_pct <= -0.5:
-        score += 3.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%) — squeeze mạnh")
+        score += 2.0; details.append(f"🔴 FR âm cực sâu ({fr_pct:.3f}%)")
     elif fr_pct <= -0.1:
-        score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%)")
+        score += 1.5; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%)")
     elif fr_pct <= -0.02:
         score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
     elif fr_pct > 0.1:
-        score -= 0.5; details.append(f"⚠️ FR dương ({fr_pct:.4f}%) — longs đang trả phí")
+        score -= 0.5; details.append(f"⚠️ FR dương ({fr_pct:.4f}%)")
 
-    # OI trend dài (4 nến) xác nhận accumulation
-    if coin.oi_change_pct >= 15:
-        score += 1.0; details.append(f"📡 OI trend tăng: +{coin.oi_change_pct:.1f}%")
-
-    # Shorts bị liq > longs = cascade up
     if coin.liq_ratio >= 3:
-        score += 2.0; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x longs — cascade")
-    elif coin.liq_ratio >= 1.5:
-        score += 1.0; details.append(f"✅ Shorts liq {coin.liq_ratio:.1f}x")
-
-    # D1 trend — nến ngày cùng chiều
+        score += 1.0; details.append(f"💥 Shorts liq {coin.liq_ratio:.1f}x")
     if coin.price_change_pct >= 5:
-        score += 1.0; details.append(f"✅ D1 cùng chiều: +{coin.price_change_pct:.1f}%")
+        score += 0.5; details.append(f"✅ D1 cùng chiều +{coin.price_change_pct:.1f}%")
 
     result.total_score = round(score, 1)
     result.details     = details
@@ -3265,6 +3350,149 @@ def score_h1_vol_spike(coin: CoinData) -> Optional["ScoreResult"]:
     return result
 
 
+def score_quiet_accumulation(coin: CoinData) -> Optional["ScoreResult"]:
+    """
+    Quiet Accumulation Detector — bắt tích lũy im lặng trước pump.
+
+    Nhận diện khi:
+      • Vol thấp (< QUIET_ACCUM_MAX_VOL x MA10) — không ai để ý
+      • Giá đứng yên hoặc tăng nhẹ (< QUIET_ACCUM_MAX_CHG%)
+      • OI Delta đột biến >= QUIET_ACCUM_OI_DELTA x avg baseline
+      • FR không quá dương (không phải long trap)
+
+    Case HEI 28/5: vol 0.4x + giá +1.15% + OI Delta bắt đầu tăng → pump +96% nến sau.
+    """
+    if not ENABLE_QUIET_ACCUM:
+        return None
+    if coin.vol_ma10 <= 0 or coin.oi_delta_avg <= 0:
+        return None
+
+    vol_ratio   = coin.volume / coin.vol_ma10 if coin.vol_ma10 > 0 else 0
+    price_chg   = abs(coin.price_change_pct)
+    fr_pct      = coin.funding_rate * 100
+    oi_delta_r  = abs(coin.oi_delta) / coin.oi_delta_avg if coin.oi_delta_avg > 0 else 0
+
+    # Filter cứng
+    if vol_ratio > QUIET_ACCUM_MAX_VOL:
+        return None
+    if price_chg > QUIET_ACCUM_MAX_CHG:
+        return None
+    if oi_delta_r < QUIET_ACCUM_OI_DELTA:
+        return None
+    if fr_pct > QUIET_ACCUM_FR_MAX:
+        return None
+    # OI Delta phải dương (tiền vào, không phải thoát)
+    if coin.oi_delta <= 0:
+        return None
+
+    result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
+    result.timeframe     = "1D-QUIET"
+    result.reversal_type = "QUIET_ACCUMULATION"
+    result.vol_ratio     = round(vol_ratio, 2)
+    result.oi_chg_pct    = round(coin.oi_spike_pct, 1)
+    result.fr            = round(fr_pct, 4)
+    result.price_current = round(coin.close, 8)
+    result.price_chg     = round(coin.price_change_pct, 2)
+
+    score   = 0.0
+    details = []
+    details.append(f"🤫 Quiet Accum: vol {vol_ratio:.2f}x MA10 | giá {coin.price_change_pct:+.2f}%")
+
+    # ── 1. OI DELTA — yếu tố chính (max 5đ) ──────────────────────────────
+    if oi_delta_r >= 10:
+        score += 5.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
+    elif oi_delta_r >= 6:
+        score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline — rất mạnh")
+    elif oi_delta_r >= 3:
+        score += 3.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline")
+
+    # ── 2. %OI SPIKE — tốc độ tăng (max 3đ) ─────────────────────────────
+    if coin.oi_spike_pct >= 15:
+        score += 3.0; details.append(f"🔥 %OI spike {coin.oi_spike_pct:.1f}% khi giá im lặng — cực đáng ngờ")
+    elif coin.oi_spike_pct >= 8:
+        score += 2.0; details.append(f"💥 %OI tăng {coin.oi_spike_pct:.1f}%")
+    elif coin.oi_spike_pct >= 4:
+        score += 1.0; details.append(f"📡 %OI tăng nhẹ {coin.oi_spike_pct:.1f}%")
+
+    # ── 3. GIÁ TĂNG NHẸ THEO OI — xác nhận hướng (max 1.5đ) ─────────────
+    if 1 <= coin.price_change_pct <= QUIET_ACCUM_MAX_CHG:
+        score += 1.5; details.append(f"✅ Giá tăng nhẹ +{coin.price_change_pct:.2f}% theo OI — đúng hướng")
+    elif coin.price_change_pct >= 0:
+        score += 0.5; details.append(f"✅ Giá giữ được ({coin.price_change_pct:+.2f}%)")
+
+    # ── 4. Vol thấp = stealth (max 1.5đ) ─────────────────────────────────
+    if vol_ratio <= 0.5:
+        score += 1.5; details.append(f"🤫 Vol cực thấp {vol_ratio:.2f}x — stealth mode")
+    elif vol_ratio <= 0.8:
+        score += 1.0; details.append(f"🤫 Vol thấp {vol_ratio:.2f}x")
+
+    # ── 5. FR âm = squeeze fuel (max 2đ) ─────────────────────────────────
+    if fr_pct <= -0.1:
+        score += 2.0; details.append(f"💥 FR âm sâu ({fr_pct:.3f}%) — squeeze fuel sẵn sàng")
+    elif fr_pct <= -0.02:
+        score += 1.0; details.append(f"💰 FR âm ({fr_pct:.4f}%)")
+    elif fr_pct <= 0:
+        score += 0.5; details.append(f"💰 FR neutral")
+
+    # OI trend dài tăng = accumulation nhiều nến liên tiếp
+    if coin.oi_change_pct >= 10:
+        score += 1.0; details.append(f"📈 OI trend +{coin.oi_change_pct:.1f}% (4 nến) — tích lũy liên tục")
+
+    result.total_score = round(score, 1)
+    result.details     = details
+
+    if result.total_score < QUIET_ACCUM_MIN_SCORE:
+        return None
+
+    # Signal label
+    if score >= 9:
+        result.signal_type = "🤫💥 QUIET ACCUM — CỰC MẠNH — Pump sắp nổ"
+    elif score >= 7:
+        result.signal_type = "🤫🚀 Quiet Accumulation — Rất mạnh"
+    elif score >= 5:
+        result.signal_type = "🤫📈 Quiet Accumulation — Theo dõi chặt"
+    else:
+        result.signal_type = "🤫 Quiet Accumulation Signal"
+
+    # TP/SL — entry vào vùng giá hiện tại, TP dựa vào OI delta strength
+    import math as _math
+    def _fmtv(v: float) -> float:
+        if v == 0: return 0.0
+        d = max(2, -int(_math.floor(_math.log10(abs(v)))) + 3)
+        return round(v, d)
+
+    entry       = coin.close
+    zone_high   = entry * 1.005
+    zone_low    = entry * 0.975
+    limit_entry = (zone_high + zone_low) / 2
+
+    result.entry_zone_low  = _fmtv(zone_low)
+    result.entry_zone_high = _fmtv(zone_high)
+    result.entry           = _fmtv(limit_entry)
+    result.sl              = _fmtv(coin.low * 0.98)
+
+    # TP scale theo OI delta ratio
+    if oi_delta_r >= 6:
+        tp1_m, tp2_m, tp3_m = 1.12, 1.25, 1.45
+    else:
+        tp1_m, tp2_m, tp3_m = 1.08, 1.18, 1.30
+
+    result.tp1 = _fmtv(limit_entry * tp1_m)
+    result.tp2 = _fmtv(limit_entry * tp2_m)
+    result.tp3 = _fmtv(limit_entry * tp3_m)
+
+    risk = abs(limit_entry - result.sl)
+    if risk > 0:
+        result.rr_tp1 = round(abs(result.tp1 - limit_entry) / risk, 2)
+        result.rr_tp2 = round(abs(result.tp2 - limit_entry) / risk, 2)
+
+    result.entry_now_allowed = True
+    result.entry_note = "🤫 Tích lũy im lặng — vào limit, đặt SL chặt, chờ nến tiếp theo xác nhận"
+    result.market_mode = "QUIET_ACCUM"
+
+    return result
+
+
 def run_intraday_early_scan() -> list[ScoreResult]:
     """
     Quét intraday early detection song song 2 sàn.
@@ -3294,6 +3522,10 @@ def run_intraday_early_scan() -> list[ScoreResult]:
                         r_h1 = score_h1_vol_spike(coin)
                         if r_h1:
                             results.append(r_h1)
+                        # Quiet Accumulation — bắt tích lũy im lặng trước pump
+                        r_qa = score_quiet_accumulation(coin)
+                        if r_qa:
+                            results.append(r_qa)
                 except Exception as e:
                     log.debug(f"Intraday {exchange} {fmap[future]}: {e}")
         log.info(f"✅ Intraday {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
@@ -4741,7 +4973,7 @@ def job():
 
         if not pump_results and not dump_results and not rev_results:
             log.warning("Không có coin nào đủ điều kiện!")
-            send_telegram("⚠️ Scan xong nhưng không tìm thấy coin nào đủ điều kiện.")
+            # Không gửi Telegram — chỉ log
             return
 
         log.info("\n" + "=" * 60)
@@ -4770,15 +5002,13 @@ def job():
                 log.info(f"   {d}")
 
         save_results(pump_results, dump_results, rev_results)
+        # Vẫn register để intraday monitor theo dõi, nhưng KHÔNG gửi Telegram 1D scan
         register_active_trades((pump_results or []) + (dump_results or []) + (rev_results or []), source="HOURLY_SCAN")
-        msg = format_alert(pump_results, dump_results, rev_results)
-        if send_telegram(msg):
-            log.info("✅ Đã gửi Telegram alert!")
-        else:
-            log.error("❌ Gửi Telegram thất bại!")
+        log.info("✅ 1D scan xong — không gửi Telegram (chỉ Intraday Early Pump mới alert).")
 
     except Exception as e:
         log.error(f"Job error: {e}", exc_info=True)
+        # Vẫn gửi error alert để biết bot lỗi
         send_telegram(f"❌ Scanner error: {e}")
 
 
@@ -5110,6 +5340,111 @@ def monitor_active_trades() -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# H2 GEM SCAN — quét mỗi 2 tiếng, tìm coin pump/squeeze sớm
+# ══════════════════════════════════════════════════════════════
+
+H2_SCAN_TOP_N   = 5      # Số coin hiển thị trong mỗi alert H2
+H2_SCAN_MINUTE  = 3      # Chạy tại xx:03 UTC của các giờ chẵn (00,02,04...)
+
+
+def run_h2_scan() -> list[ScoreResult]:
+    """Quét toàn bộ sàn trên khung H2, trả về top coin đủ điều kiện."""
+    all_results: list[ScoreResult] = []
+    scan_start = time.time()
+
+    def _scan_one(exchange: str) -> list[ScoreResult]:
+        symbols = get_all_symbols(exchange)
+        if not symbols:
+            return []
+        workers = MAX_WORKERS_BINANCE if exchange == "Binance" else MAX_WORKERS_BYBIT
+        log.info(f"🕐 H2 scan {exchange}: {len(symbols)} symbols...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fmap = {executor.submit(score_coin_h2, exchange, s): s for s in symbols}
+            for future in as_completed(fmap):
+                try:
+                    r = future.result()
+                    if r:
+                        results.append(r)
+                except Exception as e:
+                    log.debug(f"H2 {exchange} {fmap[future]}: {e}")
+        log.info(f"✅ H2 {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
+        return results
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as pool:
+        for res in pool.map(_scan_one, SCAN_EXCHANGES):
+            all_results.extend(res)
+
+    # Dedup — giữ điểm cao nhất
+    seen: dict[str, ScoreResult] = {}
+    for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
+        base = r.symbol.upper()
+        if base not in seen:
+            seen[base] = r
+
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
+    log.info(f"🕐 H2 scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
+    return final[:H2_SCAN_TOP_N]
+
+
+def format_h2_alert(results: list[ScoreResult]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"🕐 <b>H2 GEM SCAN — {now}</b>\n"]
+    lines.append("💎 <i>Top coin pump/squeeze H2 — TP theo lực tín hiệu</i>\n")
+
+    def fp(v: float) -> str:
+        return f"{v:.6g}" if v > 0 else "-"
+
+    def pct(tp, entry):
+        if entry <= 0: return ""
+        return f"{(tp - entry) / entry * 100:+.1f}%"
+
+    for i, r in enumerate(results, 1):
+        rank = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        sym  = html.escape(getattr(r, "display_symbol", r.symbol))
+        sig  = html.escape(r.signal_type)
+        mode = html.escape(r.market_mode or "")
+        lines.append(f"{'═'*28}")
+        lines.append(
+            f"{rank} <b>{sym} · {html.escape(r.exchange)}</b> — <b>{r.total_score:.1f}đ</b>\n"
+            f"<b>{sig}</b> | {mode}\n"
+            f"📈 H2: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b> | OI: <b>{r.oi_chg_pct:+.1f}%</b>\n"
+            f"FR: <b>{r.fr:.4f}%</b>"
+        )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"🎯 Entry: <b>{fp(r.entry)}</b> | SL: <b>{fp(r.sl)}</b>\n"
+                f"🎯 TP1: <b>{fp(r.tp1)}</b> <i>({pct(r.tp1, r.entry)})</i>\n"
+                f"🎯 TP2: <b>{fp(r.tp2)}</b> <i>({pct(r.tp2, r.entry)})</i>\n"
+                f"🎯 TP3: <b>{fp(r.tp3)}</b> <i>({pct(r.tp3, r.entry)})</i>"
+            )
+        lines.append("")
+
+    lines.append("⚠️ <i>TP3 dài hạn — chỉ áp dụng khi lực tín hiệu đủ mạnh (score ≥ 12đ).</i>")
+    return "\n".join(lines)
+
+
+def job_h2_scan():
+    """Chạy mỗi 2 tiếng tại xx:03 của giờ chẵn — quét H2 gem coin."""
+    try:
+        results = run_h2_scan()
+        if not results:
+            log.info("🕐 H2 scan: không có signal đủ điều kiện.")
+            return
+        msg = format_h2_alert(results)
+        if send_telegram(msg):
+            log.info(f"✅ H2 alert gửi: {len(results)} signal(s)")
+        else:
+            log.error("❌ H2 alert gửi thất bại!")
+    except Exception as e:
+        log.error(f"job_h2_scan error: {e}", exc_info=True)
+        try:
+            send_telegram(f"❌ [h2scan] error: {html.escape(str(e))}")
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════
 # TELEGRAM COMMAND HANDLER
 # ══════════════════════════════════════════════════════════════
 
@@ -5268,12 +5603,14 @@ if __name__ == "__main__":
             return dt.strftime("%Y%m%d%H%M")
 
         log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL")
-        log.info("   xx:17 / xx:47 UTC → Monitor coin đang hold + Intraday Early Pump scan")
+        log.info("   xx:02 UTC → Full scan mỗi giờ (log only, không Telegram)")
+        log.info("   00:03/02:03/.../22:03 UTC → H2 Gem Scan mỗi 2 tiếng → Telegram")
+        log.info("   xx:17 / xx:47 UTC → Intraday Early Pump scan → Telegram")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
-        last_full_slot = ""
+        last_full_slot    = ""
         last_monitor_slot = ""
+        last_h2_slot      = ""
 
         while True:
             now = datetime.now(timezone.utc)
@@ -5296,18 +5633,23 @@ if __name__ == "__main__":
                 elapsed = time.time() - scan_start
                 log.info(f"✅ Full scan xong {elapsed:.0f}s")
 
-            # Monitor active trades + Intraday early scan — chạy 1 lần trong phút xx:17 và xx:47 UTC
-            if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
-                last_monitor_slot = current_slot
+            # H2 Gem Scan — chạy mỗi 2 tiếng tại xx:03 của giờ chẵn (00,02,04,06...)
+            h2_slot_id = f"{now.year}{now.month:02d}{now.day:02d}{now.hour:02d}_h2"
+            if now.minute == H2_SCAN_MINUTE and now.hour % 2 == 0 and h2_slot_id != last_h2_slot:
+                last_h2_slot = h2_slot_id
                 try:
-                    log.info(f"👁️ [{now.strftime('%H:%M:%S UTC')}] Monitor active trades...")
-                    monitor_active_trades()
+                    log.info(f"🕐 [{now.strftime('%H:%M:%S UTC')}] H2 Gem scan...")
+                    job_h2_scan()
                 except Exception as e:
-                    log.error(f"Monitor scheduler error: {e}", exc_info=True)
+                    log.error(f"H2 scan scheduler error: {e}", exc_info=True)
                     try:
-                        send_telegram(f"❌ [monitor] error: {html.escape(str(e))}")
+                        send_telegram(f"❌ [h2scan] error: {html.escape(str(e))}")
                     except Exception:
                         pass
+
+            # Intraday early scan — chạy tại xx:17 và xx:47 UTC
+            if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
+                last_monitor_slot = current_slot
                 try:
                     log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] Intraday early scan...")
                     job_intraday_scan()
