@@ -1,4 +1,3 @@
-
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -291,6 +290,14 @@ class CoinData:
     oi_spike_pct: float = 0        # OI thay đổi so với nến LIỀN TRƯỚC (đột biến ngắn hạn)
     oi_delta: float = 0            # OI Delta tuyệt đối (net tiền vào/ra) nến hiện tại
     oi_delta_avg: float = 0        # OI Delta trung bình 5 nến trước (baseline)
+    # CVD — Cumulative Volume Delta trend (đỉnh cao hơn đáy cao hơn)
+    cvd_futures: float = 0         # Net taker flow futures nến gần nhất
+    cvd_futures_avg: float = 0     # |CVD| avg baseline
+    cvd_spot: float = 0            # Net taker spot nến gần nhất
+    cvd_fut_rising: bool = False   # CVD Futures: higher highs + higher lows
+    cvd_spot_rising: bool = False  # CVD Spot: higher highs + higher lows
+    cvd_both_rising: bool = False  # Cả 2 cùng rising
+    cvd_trend: int = 0             # Số nến CVD dương (legacy, giữ để không break)
     # Funding Rate
     funding_rate: float = 0
     # Long/Short Ratio
@@ -346,6 +353,8 @@ class ScoreResult:
     signal_type: str = ""
     vol_ratio: float = 0
     oi_chg_pct: float = 0
+    oi_delta_val: float = 0       # OI Delta tuyệt đối (USD/coins)
+    oi_delta_ratio: float = 0     # OI Delta / baseline avg (x lần đột biến)
     fr: float = 0
     lsr: float = 0
     liq_ratio: float = 0
@@ -987,6 +996,132 @@ def get_ohlcv_h2(exchange: str, symbol: str, limit: int = 15) -> Optional[list]:
     return _get_ohlcv_interval(exchange, symbol, "2h", "120", "2h", 120, limit)
 
 
+def get_cvd_data(exchange: str, symbol: str, interval: str = "1h", limit: int = 8) -> Optional[dict]:
+    """
+    Fetch CVD và tính trend đỉnh/đáy của Cumulative Volume Delta.
+
+    Yêu cầu: CVD đang tăng = đỉnh cao hơn đỉnh trước VÀ đáy cao hơn đáy trước
+    trên cả CVD Futures lẫn CVD Spot.
+
+    Trả về dict:
+      cvd_fut_delta:     net taker flow nến gần nhất (buy - sell)
+      cvd_fut_avg:       |delta| trung bình baseline
+      cvd_fut_rising:    True nếu CVD Futures đang higher highs + higher lows
+      cvd_fut_cum:       list cumulative CVD futures (để plot/debug)
+      cvd_spot_delta:    net taker spot nến gần nhất
+      cvd_spot_rising:   True nếu CVD Spot đang higher highs + higher lows
+      cvd_both_rising:   True nếu cả 2 đều rising
+      oi_delta_rising:   True nếu OI Delta cũng đang tăng (tính bên ngoài)
+    """
+
+    def _is_rising_trend(series: list[float]) -> bool:
+        """
+        Kiểm tra trend rising: đỉnh cao hơn đỉnh trước VÀ đáy cao hơn đáy trước.
+        Dùng cumulative sum để có dạng đường, sau đó tìm local peaks/troughs.
+        Cần ít nhất 4 điểm để xác định 1 đỉnh + 1 đáy.
+        """
+        if len(series) < 4:
+            # Không đủ data — dùng slope đơn giản
+            return series[-1] > series[0] if len(series) >= 2 else False
+
+        cum = []
+        total = 0.0
+        for v in series:
+            total += v
+            cum.append(total)
+
+        # Tìm local max và min (window=1)
+        peaks   = [cum[i] for i in range(1, len(cum)-1) if cum[i] >= cum[i-1] and cum[i] >= cum[i+1]]
+        troughs = [cum[i] for i in range(1, len(cum)-1) if cum[i] <= cum[i-1] and cum[i] <= cum[i+1]]
+
+        # Nếu không có đủ peaks/troughs — dùng đầu/cuối
+        if len(peaks) < 2:
+            peaks = [cum[0], cum[-1]]
+        if len(troughs) < 2:
+            troughs = [cum[0], cum[-1]]
+
+        # Higher highs: peak sau > peak trước
+        hh = peaks[-1] > peaks[-2]
+        # Higher lows: trough sau > trough trước
+        hl = troughs[-1] > troughs[-2]
+
+        return hh and hl
+
+    def _compute_deltas_binance(rows: list, taker_buy_idx: int = 9) -> list[float]:
+        deltas = []
+        for row in rows:
+            total_v    = float(row[5])
+            taker_buy  = float(row[taker_buy_idx]) if len(row) > taker_buy_idx else total_v * 0.5
+            deltas.append(taker_buy - (total_v - taker_buy))
+        return deltas
+
+    try:
+        if exchange == "Binance":
+            # ── Futures CVD ───────────────────────────────────────────────
+            fut_data = http_get_quick(f"{BINANCE_BASE}/fapi/v1/klines", {
+                "symbol": symbol, "interval": interval, "limit": limit,
+            })
+            if not fut_data or len(fut_data) < 4:
+                return None
+
+            fut_deltas      = _compute_deltas_binance(fut_data)
+            cvd_fut_delta   = fut_deltas[-1]
+            cvd_fut_avg     = sum(abs(d) for d in fut_deltas[:-1]) / max(len(fut_deltas)-1, 1)
+            cvd_fut_rising  = _is_rising_trend(fut_deltas)
+
+            # ── Spot CVD ──────────────────────────────────────────────────
+            spot_delta   = 0.0
+            spot_rising  = False
+            spot_data = http_get_quick("https://api.binance.com/api/v3/klines", {
+                "symbol": symbol, "interval": interval, "limit": limit,
+            })
+            if spot_data and len(spot_data) >= 4:
+                spot_deltas  = _compute_deltas_binance(spot_data)
+                spot_delta   = spot_deltas[-1]
+                spot_rising  = _is_rising_trend(spot_deltas)
+
+            return {
+                "cvd_fut_delta":   round(cvd_fut_delta, 2),
+                "cvd_fut_avg":     round(cvd_fut_avg, 2),
+                "cvd_fut_rising":  cvd_fut_rising,
+                "cvd_spot_delta":  round(spot_delta, 2),
+                "cvd_spot_rising": spot_rising,
+                "cvd_both_rising": cvd_fut_rising and spot_rising,
+            }
+
+        elif exchange == "Bybit":
+            data = bybit_get("/v5/market/kline", {
+                "category": "linear", "symbol": symbol,
+                "interval": interval.replace("h", "").replace("m", ""),
+                "limit": limit,
+            })
+            if not data:
+                return None
+            rows = list(reversed(data.get("list", [])))
+            if len(rows) < 4:
+                return None
+
+            # Signed vol proxy (Bybit không có taker split)
+            deltas = [float(r[5]) if float(r[4]) >= float(r[1]) else -float(r[5]) for r in rows]
+
+            cvd_fut_delta  = deltas[-1]
+            cvd_fut_avg    = sum(abs(d) for d in deltas[:-1]) / max(len(deltas)-1, 1)
+            cvd_fut_rising = _is_rising_trend(deltas)
+
+            return {
+                "cvd_fut_delta":   round(cvd_fut_delta, 2),
+                "cvd_fut_avg":     round(cvd_fut_avg, 2),
+                "cvd_fut_rising":  cvd_fut_rising,
+                "cvd_spot_delta":  0.0,
+                "cvd_spot_rising": False,
+                "cvd_both_rising": False,
+            }
+
+    except Exception as e:
+        log.debug(f"get_cvd_data {exchange} {symbol}: {e}")
+    return None
+
+
 # ══════════════════════════════════════════════════════════════
 # FUNDING / OI / LSR / LIQUIDATION
 # Ưu tiên Binance/Bybit public API để tránh Coinglass bị 500.
@@ -1210,6 +1345,16 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
                       for i in range(-6, -1)]
             coin.oi_delta_avg = sum(deltas) / len(deltas) if deltas else 0
     # Không sleep ở đây: bản FAST dùng ThreadPool + timeout ngắn
+
+    # CVD — Taker buy/sell delta trend (higher highs + higher lows)
+    cvd = get_cvd_data(exchange, symbol, interval="1h", limit=8)
+    if cvd:
+        coin.cvd_futures     = cvd["cvd_fut_delta"]
+        coin.cvd_futures_avg = cvd["cvd_fut_avg"]
+        coin.cvd_spot        = cvd["cvd_spot_delta"]
+        coin.cvd_fut_rising  = cvd["cvd_fut_rising"]
+        coin.cvd_spot_rising = cvd["cvd_spot_rising"]
+        coin.cvd_both_rising = cvd["cvd_both_rising"]
 
     lsr = get_lsr(exchange, symbol)
     coin.lsr = lsr if lsr is not None else 0
@@ -3040,7 +3185,9 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     result.timeframe     = "1D-LIVE"
     result.reversal_type = "INTRADAY_EARLY_LONG"
     result.vol_ratio     = round(vol_ratio, 2)
-    result.oi_chg_pct    = round(coin.oi_change_pct, 1)
+    result.oi_chg_pct    = round(coin.oi_spike_pct, 1)
+    result.oi_delta_val  = round(coin.oi_delta, 2)
+    result.oi_delta_ratio = round(abs(coin.oi_delta) / coin.oi_delta_avg, 1) if coin.oi_delta_avg > 0 else 0
     result.fr            = round(fr_pct, 4)
     result.lsr           = round(coin.lsr, 4)
     result.price_current = round(coin.close, 8)
@@ -3114,11 +3261,42 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     if result.total_score < INTRADAY_EARLY_MIN_SCORE:
         return None
 
-    if score >= 12:
+    # ── CVD TRIPLE CONFIRM — OI Delta tăng + CVD Futures rising + CVD Spot rising ──
+    # Điều kiện: đỉnh cao hơn đỉnh trước VÀ đáy cao hơn đáy trước trên cả 2 CVD
+    cvd_score = 0.0
+    if coin.cvd_fut_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Futures RISING — đỉnh cao hơn, đáy cao hơn")
+    elif coin.cvd_futures > 0:
+        cvd_fut_r = coin.cvd_futures / coin.cvd_futures_avg if coin.cvd_futures_avg > 0 else 0
+        cvd_score += 1.0; result.details.append(f"📈 CVD Futures dương ({cvd_fut_r:.1f}x) nhưng chưa rising trend")
+    else:
+        result.details.append(f"⚠️ CVD Futures không rising")
+
+    if coin.cvd_spot_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Spot RISING — spot buyer đang tích lũy")
+    elif coin.cvd_spot > 0:
+        cvd_score += 1.0; result.details.append(f"📈 CVD Spot dương nhưng chưa rising trend")
+    else:
+        result.details.append(f"⚠️ CVD Spot không rising")
+
+    # OI Delta tăng + cả 2 CVD rising = TRIPLE CONFIRM — tín hiệu mạnh nhất
+    if coin.oi_delta > 0 and coin.cvd_both_rising:
+        cvd_score += 4.0; result.details.append(f"🚀🚀 TRIPLE CONFIRM: OI Delta tăng + CVD Futures rising + CVD Spot rising!")
+    elif coin.oi_delta > 0 and coin.cvd_fut_rising:
+        cvd_score += 2.0; result.details.append(f"✅ DOUBLE CONFIRM: OI Delta + CVD Futures rising")
+
+    result.total_score = round(result.total_score + cvd_score, 1)
+
+    if result.total_score < INTRADAY_EARLY_MIN_SCORE:
+        return None
+
+    if coin.oi_delta > 0 and coin.cvd_both_rising and result.total_score >= 14:
+        result.signal_type = "⚡💥🚀 INTRADAY PUMP — TRIPLE CONFIRMED"
+    elif result.total_score >= 12:
         result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (OI Delta bùng nổ)"
-    elif score >= 8:
+    elif result.total_score >= 8:
         result.signal_type = "⚡🚀 INTRADAY PUMP — RẤT MẠNH"
-    elif score >= 5:
+    elif result.total_score >= 5:
         result.signal_type = "⚡📈 INTRADAY PUMP ĐANG HÌNH THÀNH"
     else:
         result.signal_type = "⚡ Intraday Pump Early Signal"
@@ -3223,14 +3401,16 @@ def score_h1_vol_spike(coin: CoinData) -> Optional["ScoreResult"]:
         return None
 
     result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    result.timeframe     = "1H-SPIKE"
-    result.reversal_type = "H1_VOL_SPIKE_LONG"
-    result.vol_ratio     = round(h1_vol_r, 2)
-    result.oi_chg_pct    = round(coin.oi_spike_pct, 1)
-    result.fr            = round(fr_pct, 4)
-    result.lsr           = round(coin.lsr, 4)
-    result.price_current = round(coin.h1_close, 8)
-    result.price_chg     = round(h1_chg, 2)
+    result.timeframe      = "1H-SPIKE"
+    result.reversal_type  = "H1_VOL_SPIKE_LONG"
+    result.vol_ratio      = round(h1_vol_r, 2)
+    result.oi_chg_pct     = round(coin.oi_spike_pct, 1)
+    result.oi_delta_val   = round(coin.oi_delta, 2)
+    result.oi_delta_ratio = round(abs(coin.oi_delta) / coin.oi_delta_avg, 1) if coin.oi_delta_avg > 0 else 0
+    result.fr             = round(fr_pct, 4)
+    result.lsr            = round(coin.lsr, 4)
+    result.price_current  = round(coin.h1_close, 8)
+    result.price_chg      = round(h1_chg, 2)
 
     score   = 0.0
     details = []
@@ -3297,12 +3477,39 @@ def score_h1_vol_spike(coin: CoinData) -> Optional["ScoreResult"]:
     if result.total_score < H1_EARLY_MIN_SCORE:
         return None
 
-    # Signal label
-    if score >= 12:
+    # ── CVD TRIPLE CONFIRM ────────────────────────────────────────
+    cvd_score = 0.0
+    if coin.cvd_fut_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Futures RISING — đỉnh/đáy cao hơn")
+    elif coin.cvd_futures > 0:
+        cvd_score += 1.0; result.details.append(f"📈 CVD Futures dương nhưng chưa rising")
+    else:
+        result.details.append(f"⚠️ CVD Futures không rising")
+
+    if coin.cvd_spot_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Spot RISING — spot accumulation xác nhận")
+    elif coin.cvd_spot > 0:
+        cvd_score += 1.0; result.details.append(f"📈 CVD Spot dương nhưng chưa rising")
+    else:
+        result.details.append(f"⚠️ CVD Spot không rising")
+
+    if coin.oi_delta > 0 and coin.cvd_both_rising:
+        cvd_score += 4.0; result.details.append(f"🚀🚀 TRIPLE CONFIRM: OI Delta + CVD Futures + CVD Spot rising!")
+    elif coin.oi_delta > 0 and coin.cvd_fut_rising:
+        cvd_score += 2.0; result.details.append(f"✅ DOUBLE CONFIRM: OI Delta + CVD Futures rising")
+
+    result.total_score = round(result.total_score + cvd_score, 1)
+
+    if result.total_score < H1_EARLY_MIN_SCORE:
+        return None
+
+    if coin.oi_delta > 0 and coin.cvd_both_rising and result.total_score >= 14:
+        result.signal_type = "⚡🔥🚀 H1 VOL SPIKE — TRIPLE CONFIRMED"
+    elif result.total_score >= 12:
         result.signal_type = "⚡🔥 H1 VOL SPIKE — CỰC MẠNH"
-    elif score >= 8:
+    elif result.total_score >= 8:
         result.signal_type = "⚡🚀 H1 VOL SPIKE — RẤT MẠNH"
-    elif score >= 6:
+    elif result.total_score >= 6:
         result.signal_type = "⚡📈 H1 Vol Spike — Mạnh"
     else:
         result.signal_type = "⚡ H1 Vol Spike Early"
@@ -3387,13 +3594,15 @@ def score_quiet_accumulation(coin: CoinData) -> Optional["ScoreResult"]:
         return None
 
     result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
-    result.timeframe     = "1D-QUIET"
-    result.reversal_type = "QUIET_ACCUMULATION"
-    result.vol_ratio     = round(vol_ratio, 2)
-    result.oi_chg_pct    = round(coin.oi_spike_pct, 1)
-    result.fr            = round(fr_pct, 4)
-    result.price_current = round(coin.close, 8)
-    result.price_chg     = round(coin.price_change_pct, 2)
+    result.timeframe      = "1D-QUIET"
+    result.reversal_type  = "QUIET_ACCUMULATION"
+    result.vol_ratio      = round(vol_ratio, 2)
+    result.oi_chg_pct     = round(coin.oi_spike_pct, 1)
+    result.oi_delta_val   = round(coin.oi_delta, 2)
+    result.oi_delta_ratio = round(oi_delta_r, 1)
+    result.fr             = round(fr_pct, 4)
+    result.price_current  = round(coin.close, 8)
+    result.price_chg      = round(coin.price_change_pct, 2)
 
     score   = 0.0
     details = []
@@ -3445,12 +3654,39 @@ def score_quiet_accumulation(coin: CoinData) -> Optional["ScoreResult"]:
     if result.total_score < QUIET_ACCUM_MIN_SCORE:
         return None
 
-    # Signal label
-    if score >= 9:
+    # ── CVD TRIPLE CONFIRM ────────────────────────────────────────
+    cvd_score = 0.0
+    if coin.cvd_fut_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Futures RISING — smart money mua ngầm liên tục")
+    elif coin.cvd_futures > 0:
+        cvd_score += 1.0; result.details.append(f"📈 CVD Futures dương khi vol thấp — đáng ngờ")
+    else:
+        result.details.append(f"⚠️ CVD Futures không rising")
+
+    if coin.cvd_spot_rising:
+        cvd_score += 3.0; result.details.append(f"🔥 CVD Spot RISING — spot accumulation im lặng")
+    elif coin.cvd_spot > 0:
+        cvd_score += 1.5; result.details.append(f"📈 CVD Spot dương nhưng chưa rising")
+    else:
+        result.details.append(f"⚠️ CVD Spot không rising")
+
+    if coin.oi_delta > 0 and coin.cvd_both_rising:
+        cvd_score += 4.0; result.details.append(f"🚀🚀 TRIPLE CONFIRM: OI Delta + CVD Fut + CVD Spot rising — Pump sắp nổ!")
+    elif coin.oi_delta > 0 and coin.cvd_fut_rising:
+        cvd_score += 2.0; result.details.append(f"✅ DOUBLE CONFIRM: OI Delta + CVD Futures rising")
+
+    result.total_score = round(result.total_score + cvd_score, 1)
+
+    if result.total_score < QUIET_ACCUM_MIN_SCORE:
+        return None
+
+    if coin.oi_delta > 0 and coin.cvd_both_rising and result.total_score >= 14:
+        result.signal_type = "🤫🚀💥 QUIET ACCUM — TRIPLE CONFIRMED — Pump sắp nổ"
+    elif result.total_score >= 9:
         result.signal_type = "🤫💥 QUIET ACCUM — CỰC MẠNH — Pump sắp nổ"
-    elif score >= 7:
+    elif result.total_score >= 7:
         result.signal_type = "🤫🚀 Quiet Accumulation — Rất mạnh"
-    elif score >= 5:
+    elif result.total_score >= 5:
         result.signal_type = "🤫📈 Quiet Accumulation — Theo dõi chặt"
     else:
         result.signal_type = "🤫 Quiet Accumulation Signal"
@@ -3568,12 +3804,38 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
         rank = "🥇" if i == 1 else "🥈"
         sym  = html.escape(r.display_symbol if hasattr(r, "display_symbol") else r.symbol)
         sig  = html.escape(r.signal_type)
+
+        # CVD rising status
+        cvd_line = ""
+        if coin_cvd_both := getattr(r, "_cvd_both", None):
+            cvd_line = "\n🚀 CVD Fut ↑ + CVD Spot ↑ — TRIPLE CONFIRMED"
+        
+        # Build OI Delta line
+        if r.oi_delta_val != 0:
+            delta_fmt = f"{r.oi_delta_val/1e6:.2f}M" if abs(r.oi_delta_val) >= 1e6 else f"{r.oi_delta_val/1e3:.1f}K"
+            ratio_str = f" ({r.oi_delta_ratio:.1f}x baseline)" if r.oi_delta_ratio >= 2 else ""
+            oi_line = f"📡 OI Delta: <b>+{delta_fmt}{ratio_str}</b> | %OI: <b>{r.oi_chg_pct:+.1f}%</b>"
+        else:
+            oi_line = f"📡 OI: <b>{r.oi_chg_pct:+.1f}%</b>"
+
+        # CVD status line
+        cvd_status = []
+        if "TRIPLE CONFIRM" in " ".join(r.details):
+            cvd_status.append("🚀 CVD Fut ↑ + CVD Spot ↑")
+        elif "DOUBLE CONFIRM" in " ".join(r.details):
+            cvd_status.append("✅ CVD Fut ↑")
+        elif "CVD Futures RISING" in " ".join(r.details):
+            cvd_status.append("📈 CVD Fut ↑")
+        cvd_line = " | ".join(cvd_status) if cvd_status else ""
+
         lines.append(f"{'═'*30}")
         lines.append(
             f"{rank} <b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
             f"⚡ <b>{sig}</b>\n"
-            f"📈 Pump: <b>+{r.price_chg:.2f}%</b> từ open | Vol: <b>{r.vol_ratio:.1f}x</b>\n"
-            f"📡 OI: <b>{r.oi_chg_pct:+.1f}%</b> | FR: <b>{r.fr:.4f}%</b>"
+            f"📈 Pump: <b>+{r.price_chg:.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b>\n"
+            f"{oi_line}"
+            + (f"\n{cvd_line}" if cvd_line else "") +
+            f"\nFR: <b>{r.fr:.4f}%</b>"
         )
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
@@ -3677,12 +3939,21 @@ def format_h1_spike_alert(results: list[ScoreResult]) -> str:
         sym  = html.escape(getattr(r, "display_symbol", r.symbol))
         sig  = html.escape(r.signal_type)
         mode = html.escape(r.market_mode or "")
+
+        # OI Delta display
+        if r.oi_delta_val != 0:
+            delta_fmt = f"{r.oi_delta_val/1e6:.2f}M" if abs(r.oi_delta_val) >= 1e6 else f"{r.oi_delta_val/1e3:.1f}K"
+            ratio_str = f" = <b>{r.oi_delta_ratio:.1f}x</b> baseline" if r.oi_delta_ratio >= 2 else ""
+            oi_line = f"📡 OI Delta: <b>+{delta_fmt}</b>{ratio_str} | %OI: <b>{r.oi_chg_pct:+.1f}%</b> | FR: <b>{r.fr:.4f}%</b>"
+        else:
+            oi_line = f"📡 OI: <b>{r.oi_chg_pct:+.1f}%</b> | FR: <b>{r.fr:.4f}%</b>"
+
         lines.append(f"{'═'*28}")
         lines.append(
             f"{rank} <b>{sym} · {html.escape(r.exchange)}</b> — <b>{r.total_score:.1f}đ</b>\n"
             f"<b>{sig}</b>\n"
-            f"📈 H1: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b> | OI: <b>{r.oi_chg_pct:+.1f}%</b>\n"
-            f"FR: <b>{r.fr:.4f}%</b> | {mode}"
+            f"📈 H1: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b> | {mode}\n"
+            f"{oi_line}"
         )
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
@@ -5496,12 +5767,21 @@ def format_h2_alert(results: list[ScoreResult]) -> str:
         sym  = html.escape(getattr(r, "display_symbol", r.symbol))
         sig  = html.escape(r.signal_type)
         mode = html.escape(r.market_mode or "")
+
+        # OI Delta display
+        if r.oi_delta_val != 0:
+            delta_fmt = f"{r.oi_delta_val/1e6:.2f}M" if abs(r.oi_delta_val) >= 1e6 else f"{r.oi_delta_val/1e3:.1f}K"
+            ratio_str = f" = <b>{r.oi_delta_ratio:.1f}x</b> baseline" if r.oi_delta_ratio >= 2 else ""
+            oi_line = f"📡 OI Delta: <b>+{delta_fmt}</b>{ratio_str} | %OI: <b>{r.oi_chg_pct:+.1f}%</b>"
+        else:
+            oi_line = f"📡 OI: <b>{r.oi_chg_pct:+.1f}%</b>"
+
         lines.append(f"{'═'*28}")
         lines.append(
             f"{rank} <b>{sym} · {html.escape(r.exchange)}</b> — <b>{r.total_score:.1f}đ</b>\n"
             f"<b>{sig}</b> | {mode}\n"
-            f"📈 H2: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b> | OI: <b>{r.oi_chg_pct:+.1f}%</b>\n"
-            f"FR: <b>{r.fr:.4f}%</b>"
+            f"📈 H2: <b>{r.price_chg:+.2f}%</b> | Vol: <b>{r.vol_ratio:.1f}x</b>\n"
+            f"{oi_line} | FR: <b>{r.fr:.4f}%</b>"
         )
         if r.entry > 0 and r.tp1 > 0:
             lines.append(
