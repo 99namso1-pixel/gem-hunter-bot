@@ -1,3 +1,4 @@
+
 # ============================================================
 # STAIR-STEP / TREND CONTINUATION ENGINE
 # ============================================================
@@ -5232,104 +5233,6 @@ def job_hold_check():
         log.info(f"🚨 Urgent alert gửi: {len(urgent_lines)} signal(s)")
 
 
-def run_h2_scan() -> tuple[list[ScoreResult], list[ScoreResult]]:
-    """Quét H2 song song 4 sàn. Trả về (pump_top2, dump_top2)."""
-    all_pump: list[ScoreResult] = []
-    all_dump:  list[ScoreResult] = []
-    scan_start = time.time()
-
-    def _scan_exchange_h2(exchange: str) -> list[ScoreResult]:
-        symbols = get_all_symbols(exchange)
-        if not symbols: return []
-        workers = (MAX_WORKERS_BINANCE if exchange == "Binance"
-                   else MAX_WORKERS_BINGX if exchange == "BingX"
-                   else MAX_WORKERS_KUCOIN if exchange == "KuCoin"
-                   else MAX_WORKERS_BYBIT)
-        log.info(f"⚡ H2 scan {exchange}: {len(symbols)} symbols...")
-        results = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            fmap = {executor.submit(score_coin_h2, exchange, s): s for s in symbols}
-            for future in as_completed(fmap):
-                try:
-                    r = future.result()
-                    if r: results.append(r)
-                except Exception as e:
-                    log.debug(f"H2 {exchange} {fmap[future]}: {e}")
-        log.info(f"✅ H2 {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
-        return results
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EXCHANGES) as ex_pool:
-        futures = {ex_pool.submit(_scan_exchange_h2, ex): ex for ex in SCAN_EXCHANGES}
-        for future in as_completed(futures):
-            try:
-                for r in future.result():
-                    if "PUMP" in r.market_mode:
-                        all_pump.append(r)
-                    else:
-                        all_dump.append(r)
-            except Exception as e:
-                log.error(f"H2 scan error: {e}")
-
-    # Dedup
-    def dedup_h2(lst: list[ScoreResult]) -> list[ScoreResult]:
-        seen: dict[str, ScoreResult] = {}
-        for r in sorted(lst, key=lambda x: x.total_score, reverse=True):
-            base = r.symbol.upper()
-            if base.endswith("USDTM"): base = base[:-1]
-            if base not in seen: seen[base] = r
-        return list(seen.values())
-
-    pumps = dedup_h2(all_pump)
-    dumps = dedup_h2(all_dump)
-    pumps.sort(key=lambda x: x.total_score, reverse=True)
-    dumps.sort(key=lambda x: x.total_score, reverse=True)
-
-    log.info(f"⚡ H2 scan xong: {time.time()-scan_start:.1f}s | pump {len(pumps)} | dump {len(dumps)}")
-    return pumps[:2], dumps[:2]
-
-
-def format_h2_alert(pump: list[ScoreResult], dump: list[ScoreResult]) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"⚡ <b>H2 SCAN — {now}</b>\n"]
-
-    def fmt_r(r: ScoreResult, section: str) -> None:
-        sym    = html.escape(r.display_symbol)
-        signal = html.escape(r.signal_type)
-        icon   = "🟢" if "PUMP" in r.market_mode else "🔴"
-
-        def pct(t, e):
-            if e <= 0: return ""
-            return f"{(t-e)/e*100:+.2f}%"
-
-        lines.append(f"{'═'*27}")
-        lines.append(f"{icon} <b>{section}</b>")
-        lines.append(f"{'═'*27}\n")
-        lines.append(
-            f"<b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
-            f"⚡ <b>{signal}</b>\n"
-            f"H2: {r.price_chg:+.2f}% | Vol: {r.vol_ratio:.1f}x | "
-            f"OI: {r.oi_chg_pct:+.1f}% | FR: {r.fr:.4f}%"
-        )
-        if r.entry > 0 and r.tp1 > 0:
-            lines.append(
-                f"📍 Entry: <b>{r.entry:.6g}</b> | SL: <b>{r.sl:.6g}</b>\n"
-                f"🎯 TP1: <b>{r.tp1:.6g}</b> ({pct(r.tp1, r.entry)}) R:R {r.rr_tp1:.1f}\n"
-                f"🎯 TP2: <b>{r.tp2:.6g}</b> ({pct(r.tp2, r.entry)}) R:R {r.rr_tp2:.1f}\n"
-                f"🎯 TP3: <b>{r.tp3:.6g}</b> ({pct(r.tp3, r.entry)})"
-            )
-        lines.append("")
-
-    if pump:
-        fmt_r(pump[0], "H2 PUMP — MUA NGẮN HẠN")
-    if dump:
-        fmt_r(dump[0], "H2 DUMP — SHORT NGẮN HẠN")
-    if not pump and not dump:
-        lines.append("<i>Không có H2 signal đủ điều kiện.</i>")
-
-    lines.append("⚠️ <i>Target 15-30%. Luôn đặt SL chặt.</i>")
-    return "\n".join(lines)
-
-
 def job():
     try:
         pump_results, dump_results, rev_results = run_scan()
@@ -5975,28 +5878,27 @@ if __name__ == "__main__":
             return dt.strftime("%Y%m%d%H%M")
 
         log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:02 UTC → Full 1D scan (log only)")
-        log.info("   xx:05 UTC → H1 Vol Spike scan mỗi giờ → Telegram")
-        log.info("   00:03/02:03/.../22:03 UTC → H2 Gem Scan mỗi 2 tiếng → Telegram")
+        log.info("   xx:02 UTC → Full 1D scan (log only) + H1 Vol Spike scan → Telegram")
+        log.info("   xx:02 giờ chẵn UTC → H2 Gem Scan mỗi 2 tiếng → Telegram")
         log.info("   xx:17 / xx:47 UTC → Intraday Early Pump scan → Telegram")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
         last_full_slot    = ""
         last_monitor_slot = ""
         last_h2_slot      = ""
-        last_h1_slot      = ""
 
         while True:
             now = datetime.now(timezone.utc)
             current_slot = slot_id(now)
 
-            # Full scan hourly — chạy 1 lần trong phút xx:02 UTC
+            # xx:02 UTC — Full 1D scan (log only) + H1 Vol Spike (Telegram)
+            # H2 Gem Scan chạy thêm nếu là giờ chẵn
             if now.minute == FULL_SCAN_MINUTE and current_slot != last_full_slot:
                 last_full_slot = current_slot
-                scan_start_dt = datetime.now(timezone.utc)
-                scan_start = time.time()
+
+                # 1. Full 1D scan — log only
                 try:
-                    log.info(f"🚀 [{scan_start_dt.strftime('%H:%M:%S UTC')}] Full scan hourly...")
+                    log.info(f"🚀 [{now.strftime('%H:%M:%S UTC')}] Full 1D scan...")
                     job()
                 except Exception as e:
                     log.error(f"Scheduler hourly error: {e}", exc_info=True)
@@ -6004,35 +5906,31 @@ if __name__ == "__main__":
                         send_telegram(f"❌ [hourly] error: {html.escape(str(e))}")
                     except Exception:
                         pass
-                elapsed = time.time() - scan_start
-                log.info(f"✅ Full scan xong {elapsed:.0f}s")
 
-            # H1 Vol Spike scan — mỗi giờ tại xx:05 UTC (5 phút sau nến H1 đóng)
-            if now.minute == 5 and current_slot != last_h1_slot:
-                last_h1_slot = current_slot
+                # 2. H1 Vol Spike scan — Telegram mỗi giờ
                 try:
                     log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] H1 Vol Spike scan...")
                     job_h1_spike_scan()
                 except Exception as e:
-                    log.error(f"H1 spike scheduler error: {e}", exc_info=True)
+                    log.error(f"H1 spike error: {e}", exc_info=True)
                     try:
                         send_telegram(f"❌ [h1spike] error: {html.escape(str(e))}")
                     except Exception:
                         pass
 
-            # H2 Gem Scan — chạy mỗi 2 tiếng tại xx:03 của giờ chẵn
-            h2_slot_id = f"{now.year}{now.month:02d}{now.day:02d}{now.hour:02d}_h2"
-            if now.minute == H2_SCAN_MINUTE and now.hour % 2 == 0 and h2_slot_id != last_h2_slot:
-                last_h2_slot = h2_slot_id
-                try:
-                    log.info(f"🕐 [{now.strftime('%H:%M:%S UTC')}] H2 Gem scan...")
-                    job_h2_scan()
-                except Exception as e:
-                    log.error(f"H2 scan scheduler error: {e}", exc_info=True)
+                # 3. H2 Gem Scan — Telegram mỗi 2 tiếng (giờ chẵn)
+                h2_slot_id = f"{now.year}{now.month:02d}{now.day:02d}{now.hour:02d}_h2"
+                if now.hour % 2 == 0 and h2_slot_id != last_h2_slot:
+                    last_h2_slot = h2_slot_id
                     try:
-                        send_telegram(f"❌ [h2scan] error: {html.escape(str(e))}")
-                    except Exception:
-                        pass
+                        log.info(f"🕐 [{now.strftime('%H:%M:%S UTC')}] H2 Gem scan...")
+                        job_h2_scan()
+                    except Exception as e:
+                        log.error(f"H2 scan error: {e}", exc_info=True)
+                        try:
+                            send_telegram(f"❌ [h2scan] error: {html.escape(str(e))}")
+                        except Exception:
+                            pass
 
             # Intraday early scan — chạy tại xx:17 và xx:47 UTC
             if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
