@@ -2786,20 +2786,20 @@ def score_coin_h2(exchange: str, symbol: str) -> Optional[ScoreResult]:
     - Thêm bonus FR âm + pump = short squeeze H2
     - Liq shorts >> longs = squeeze setup
     """
-    candles = get_ohlcv_h2(exchange, symbol, limit=15)
-    if not candles or len(candles) < 5:
+    candles = get_ohlcv_h2(exchange, symbol, limit=16)
+    if not candles or len(candles) < 6:
         return None
 
-    # Nến vừa đóng = candles[-1]
-    latest = candles[-1]
+    # candles[-1] là nến đang live (chưa đóng) — dùng candles[-2] là nến vừa đóng thật sự
+    latest = candles[-2]
     h2_o = float(latest.get("o", 0)); h2_h = float(latest.get("h", 0))
     h2_l = float(latest.get("l", 0)); h2_c = float(latest.get("c", 0))
     h2_v = float(latest.get("v", 0))
     if h2_o <= 0 or h2_c <= 0:
         return None
 
-    # Vol MA10 từ 10 nến trước
-    prev_vols = [float(c.get("v", 0)) for c in candles[-11:-1]]
+    # Vol MA10 từ 10 nến trước nến đã đóng (candles[-12:-2])
+    prev_vols = [float(c.get("v", 0)) for c in candles[-12:-2]]
     vol_ma = sum(prev_vols) / len(prev_vols) if prev_vols else 0
     if vol_ma <= 0:
         return None
