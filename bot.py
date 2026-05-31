@@ -140,8 +140,8 @@ DEADCAT_RETRACE_MIN = 0.382          # Entry zone short: hồi 38.2% nhịp dump
 DEADCAT_RETRACE_MAX = 0.618          # Entry zone short: hồi 61.8% nhịp dump
 
 # ── 1H Reversal Engine ────────────────────────────────────────
-ENABLE_1H_REVERSAL = False              # Bật/tắt scan 1H reversal
-ENABLE_30MIN_SCAN = False               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
+ENABLE_1H_REVERSAL = True              # Bật/tắt scan 1H reversal
+ENABLE_30MIN_SCAN = True               # Bật/tắt scan reversal mỗi 30 phút (xx:32 UTC)
 DAILY_SCAN_HOUR   = 0                  # Giờ UTC chạy full scan 1D (0 = 00:02 UTC)
 # Pump Reversal: coin pump mạnh 1D nhưng 1H đang đảo chiều xuống
 PUMP_REV_1D_MIN_PUMP = 10.0           # 1D tăng tối thiểu 10% trước đó
@@ -177,7 +177,7 @@ H1_BREAKOUT_FR_BONUS    = -0.05  # FR âm ≤ ngưỡng này → bonus squeeze
 # ── H1 Vol Spike Early Alert — bắt nến H1 đầu tiên của sóng pump ────────────
 # Trigger NGAY khi nến H1 vừa đóng với vol spike mạnh, không cần intraday_chg 15%.
 # Case OKB: nến H1 09:00 tăng +3.14% với vol 4.7x MA10 → alert lúc 09:01.
-ENABLE_H1_VOL_SPIKE     = False  # OFF: chỉ gửi INTRADAY EARLY PUMP
+ENABLE_H1_VOL_SPIKE     = True
 H1_EARLY_MIN_VOL        = 3.5    # Vol H1 >= 3.5x MA10
 H1_EARLY_MIN_CHG        = 2.5    # H1 tăng >= 2.5% (thấp để bắt sớm)
 H1_EARLY_OI_MIN         = 5.0    # OI spike 1 nến >= 5%
@@ -186,7 +186,7 @@ H1_EARLY_MIN_SCORE      = 4.0    # Score tối thiểu để lọt
 # ── Quiet Accumulation Detector — bắt tích lũy im lặng trước pump ────────────
 # Vol thấp + giá đứng yên NHƯNG OI Delta tăng đột biến = smart money đang vào.
 # Case HEI 28/5: vol 0.4x MA10 + giá +1.15% nhưng OI Delta bắt đầu tăng → pump tiếp theo +96%.
-ENABLE_QUIET_ACCUM      = False  # OFF: chỉ gửi INTRADAY EARLY PUMP
+ENABLE_QUIET_ACCUM      = True
 QUIET_ACCUM_MAX_VOL     = 1.2    # Vol <= 1.2x MA10 (im lặng)
 QUIET_ACCUM_MAX_CHG     = 5.0    # Giá thay đổi <= 5% (không pump rõ)
 QUIET_ACCUM_OI_DELTA    = 3.0    # OI Delta tăng >= 3x so với trung bình (đột biến)
@@ -202,14 +202,11 @@ INTRADAY_EARLY_MIN_VOL  = 3.0    # Vol hiện tại >= 3x MA10 vol ngày
 INTRADAY_EARLY_FR_DEEP  = -0.15  # FR âm <= -0.15% → squeeze fuel bonus
 INTRADAY_EARLY_OI_MIN   = 15.0   # OI tăng >= 15% → xác nhận dòng tiền thật
 INTRADAY_EARLY_MIN_SCORE = 3.0   # Score tối thiểu để lọt list
-
-# ── Smart Money / Baseline priority ───────────────────────────
-# Ưu tiên coin TRIPLE CONFIRMED + mới thoát nền baseline, tránh coin đã pump quá xa.
-SMART_BASELINE_ULTRA_EARLY = 5.0      # <=5% trên baseline = cực sớm
-SMART_BASELINE_EARLY       = 8.0      # <=8% trên baseline = mới thoát nền
-SMART_BASELINE_OK          = 15.0     # <=15% vẫn còn ổn
-SMART_OVEREXTENDED_PCT     = 25.0     # >25% trên baseline = đã chạy xa, trừ điểm
-SMART_OI_DELTA_STRONG      = 2.0      # OI Delta >=2x baseline để xác nhận tiền mới vào
+# V8.1 — chỉ alert INTRADAY PUMP chất lượng cao:
+# bắt buộc OI Delta tăng mạnh so với baseline + %OI tăng + CVD Futures & Spot cùng rising
+INTRADAY_REQUIRE_TRIPLE_CONFIRMED = True
+INTRADAY_BASELINE_OI_DELTA_MIN_X = 3.0
+INTRADAY_BASELINE_OI_SPIKE_MIN_PCT = 8.0
 
 # Engine mode
 TREND_MIN_SCORE = 5.0                   # Ngưỡng nhận diện TREND coin kiểu IRYS
@@ -317,8 +314,6 @@ class CoinData:
     liq_ratio: float = 0
     # Long-term low
     low_20d: float = 0
-    baseline_ma20: float = 0          # Baseline MA20 daily trước nến hiện tại
-    baseline_break_pct: float = 0     # % close hiện tại so với baseline MA20
     # 1D lookback: % change của 2 nến ngày trước (để bắt reversal sau pump/dump hôm qua)
     prev1d_change_pct: float = 0   # nến[-2]: hôm qua
     prev2d_change_pct: float = 0   # nến[-3]: hôm kia
@@ -372,7 +367,6 @@ class ScoreResult:
     price_chg: float = 0
     price_current: float = 0    # Giá hiện tại (close nến gần nhất)
     day_low: float = 0          # Giá thấp nhất trong ngày
-    baseline_break_pct: float = 0 # % giá hiện tại so với baseline MA20
     timeframe: str = "1D"       # "1D" hoặc "1H" hoặc "REV"
     reversal_type: str = ""     # "PUMP_REVERSAL" / "DUMP_REVERSAL" / "H1_BREAKOUT_LONG" / "H1_BREAKOUT_SHORT"
     h1_chg: float = 0           # % thay đổi nến 1H gần nhất
@@ -1332,13 +1326,6 @@ def fetch_coin_data(exchange: str, symbol: str) -> Optional[CoinData]:
 
     lows_20 = [float(c.get("l", 0)) for c in candles[-21:-1]]
     coin.low_20d = min(lows_20) if lows_20 else 0
-
-    # Baseline MA20 daily: dùng 20 nến trước nến hiện tại để xem coin mới thoát nền hay đã chạy xa.
-    prev_closes_20 = [float(c.get("c", 0)) for c in candles[-21:-1] if float(c.get("c", 0)) > 0]
-    if prev_closes_20:
-        coin.baseline_ma20 = sum(prev_closes_20) / len(prev_closes_20)
-        if coin.baseline_ma20 > 0:
-            coin.baseline_break_pct = (coin.close / coin.baseline_ma20 - 1.0) * 100.0
 
     fr = get_funding_rate(exchange, symbol)
     coin.funding_rate = fr if fr is not None else 0
@@ -3193,18 +3180,11 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     vol_ratio    = coin.volume / coin.vol_ma10 if coin.vol_ma10 > 0 else 0
     fr_pct       = coin.funding_rate * 100
     oi_delta_r   = abs(coin.oi_delta) / coin.oi_delta_avg if coin.oi_delta_avg > 0 else 0
-    baseline_pct = coin.baseline_break_pct if coin.baseline_ma20 > 0 else 999.0
 
-    # Smart-money bypass: nếu TRIPLE CONFIRMED + OI Delta mới tăng từ baseline,
-    # vẫn cho lọt dù intraday_chg/vol chưa đạt ngưỡng cứng.
-    triple_confirmed_pre = (coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG)
-    early_from_baseline  = (0 <= baseline_pct <= SMART_BASELINE_EARLY)
-    smart_money_early    = triple_confirmed_pre and early_from_baseline
-
-    # Filter cứng — nhưng cho phép bypass với SMART MONEY EARLY.
-    if intraday_chg < INTRADAY_EARLY_MIN_CHG and not smart_money_early:
+    # Filter cứng
+    if intraday_chg < INTRADAY_EARLY_MIN_CHG:
         return None
-    if vol_ratio < INTRADAY_EARLY_MIN_VOL and not smart_money_early:
+    if vol_ratio < INTRADAY_EARLY_MIN_VOL:
         return None
 
     result = ScoreResult(symbol=coin.symbol, exchange=coin.exchange)
@@ -3219,34 +3199,20 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
     result.price_current = round(coin.close, 8)
     result.price_chg     = round(intraday_chg, 2)
     result.day_low       = round(coin.low, 8)
-    result.baseline_break_pct = round(baseline_pct, 2) if baseline_pct != 999.0 else 0
 
     score   = 0.0
     details = []
     details.append(f"⚡ Intraday Pump: open {coin.open:.6g} → now {coin.close:.6g} (+{intraday_chg:.1f}%)")
-    if coin.baseline_ma20 > 0:
-        details.append(f"🧱 Baseline MA20: {coin.baseline_ma20:.6g} | Break: {baseline_pct:+.1f}%")
-
-    # ── 0. BASELINE PRIORITY — mới thoát nền được cộng mạnh, chạy xa bị trừ ──
-    if 0 <= baseline_pct <= SMART_BASELINE_ULTRA_EARLY:
-        score += 6.0; details.append(f"🧠 Vừa thoát baseline +{baseline_pct:.1f}% — CỰC SỚM, ưu tiên TOP")
-    elif 0 <= baseline_pct <= SMART_BASELINE_EARLY:
-        score += 4.0; details.append(f"🧠 Mới thoát baseline +{baseline_pct:.1f}% — smart money zone")
-    elif 0 <= baseline_pct <= SMART_BASELINE_OK:
-        score += 2.0; details.append(f"✅ Còn gần baseline +{baseline_pct:.1f}%")
-    elif baseline_pct > SMART_OVEREXTENDED_PCT:
-        penalty = 7.0 if baseline_pct >= 40 else 4.0
-        score -= penalty; details.append(f"⚠️ Đã chạy xa baseline +{baseline_pct:.1f}% — trừ {penalty:.0f} điểm, tránh FOMO")
 
     # ── 1. OI DELTA — yếu tố chính (max 5đ) ──────────────────────────────
     if coin.oi_delta > 0:
-        if oi_delta_r >= 4:
+        if oi_delta_r >= 10:
             score += 5.0; details.append(f"🚀 OI Delta {oi_delta_r:.1f}x baseline — tiền mới vào CỰC MẠNH")
-        elif oi_delta_r >= 3:
+        elif oi_delta_r >= 6:
             score += 4.0; details.append(f"💥 OI Delta {oi_delta_r:.1f}x baseline — rất mạnh")
-        elif oi_delta_r >= 2:
+        elif oi_delta_r >= 3:
             score += 3.0; details.append(f"📡 OI Delta {oi_delta_r:.1f}x baseline — mạnh")
-        elif oi_delta_r >= 1:
+        else:
             score += 1.5; details.append(f"📡 OI Delta tăng (x{oi_delta_r:.1f})")
     else:
         details.append("⚠️ OI Delta âm — không có tiền mới vào")
@@ -3320,26 +3286,32 @@ def score_intraday_early(coin: CoinData) -> Optional[ScoreResult]:
         result.details.append(f"⚠️ CVD Spot không rising")
 
     # OI Delta tăng + cả 2 CVD rising = TRIPLE CONFIRM — tín hiệu mạnh nhất
-    triple_confirmed = coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG
+    baseline_early_ok = (
+        coin.oi_delta > 0
+        and oi_delta_r >= INTRADAY_BASELINE_OI_DELTA_MIN_X
+        and coin.oi_spike_pct >= INTRADAY_BASELINE_OI_SPIKE_MIN_PCT
+    )
+    triple_confirmed = baseline_early_ok and coin.cvd_both_rising
+
     if triple_confirmed:
-        cvd_score += 5.0; result.details.append(f"🚀🚀 TRIPLE CONFIRMED: OI Delta {oi_delta_r:.1f}x + CVD Futures rising + CVD Spot rising — ƯU TIÊN TỐI ĐA")
-        if 0 <= baseline_pct <= SMART_BASELINE_EARLY:
-            cvd_score += 3.0; result.details.append(f"🧠 SMART MONEY ENTRY: Triple Confirmed + mới tăng từ baseline +{baseline_pct:.1f}%")
-        if fr_pct < 0:
-            cvd_score += 2.0; result.details.append(f"💣 Funding âm + Triple Confirmed — có squeeze fuel")
+        cvd_score += 4.0
+        result.details.append(
+            f"🚀🚀 TRIPLE CONFIRMED + BASELINE EARLY: "
+            f"OI Delta {oi_delta_r:.1f}x baseline + %OI {coin.oi_spike_pct:.1f}% + CVD Fut ↑ + CVD Spot ↑"
+        )
     elif coin.oi_delta > 0 and coin.cvd_fut_rising:
         cvd_score += 2.0; result.details.append(f"✅ DOUBLE CONFIRM: OI Delta + CVD Futures rising")
+
+    if INTRADAY_REQUIRE_TRIPLE_CONFIRMED and not triple_confirmed:
+        return None
 
     result.total_score = round(result.total_score + cvd_score, 1)
 
     if result.total_score < INTRADAY_EARLY_MIN_SCORE:
         return None
 
-    triple_confirmed_final = coin.oi_delta > 0 and coin.cvd_both_rising and oi_delta_r >= SMART_OI_DELTA_STRONG
-    if triple_confirmed_final and 0 <= baseline_pct <= SMART_BASELINE_EARLY:
-        result.signal_type = "🧠🚀 SMART MONEY ENTRY — TRIPLE CONFIRMED + BASELINE EARLY"
-    elif triple_confirmed_final and result.total_score >= 14:
-        result.signal_type = "⚡💥🚀 INTRADAY PUMP — TRIPLE CONFIRMED"
+    if coin.oi_delta > 0 and coin.cvd_both_rising and result.total_score >= 14:
+        result.signal_type = "⚡💥🚀 INTRADAY PUMP — TRIPLE CONFIRMED + BASELINE EARLY"
     elif result.total_score >= 12:
         result.signal_type = "⚡💥 INTRADAY PUMP — CỰC MẠNH (OI Delta bùng nổ)"
     elif result.total_score >= 8:
@@ -3799,12 +3771,11 @@ def run_intraday_early_scan() -> list[ScoreResult]:
                 try:
                     coin = future.result()
                     if coin:
-                        # Intraday D-level early (pump 15%+ từ open ngày)
+                        # V8.1: chỉ quét INTRADAY PUMP đúng nghĩa.
+                        # Không trộn H1 Vol Spike / Quiet Accum / Reversal / Dump vào alert này.
                         r = score_intraday_early(coin)
                         if r:
                             results.append(r)
-                        # ĐÃ TẮT: H1 Vol Spike + Quiet Accumulation
-                        # Chỉ lấy đúng score_intraday_early() để Telegram chỉ có INTRADAY EARLY PUMP.
                 except Exception as e:
                     log.debug(f"Intraday {exchange} {fmap[future]}: {e}")
         log.info(f"✅ Intraday {exchange}: {len(results)} signals | {time.time()-scan_start:.0f}s")
@@ -3818,21 +3789,14 @@ def run_intraday_early_scan() -> list[ScoreResult]:
             except Exception as e:
                 log.error(f"Intraday scan error: {e}")
 
-    # Dedup — giữ bản điểm cao nhất cho mỗi symbol, ưu tiên TRIPLE CONFIRMED + mới thoát baseline.
-    def _intraday_rank_key(x: ScoreResult):
-        text = (x.signal_type + " " + " ".join(x.details)).upper()
-        is_triple = 1 if "TRIPLE" in text else 0
-        is_smart  = 1 if "SMART MONEY" in text or "BASELINE EARLY" in text else 0
-        baseline_bonus = max(0.0, SMART_BASELINE_EARLY - x.baseline_break_pct) if x.baseline_break_pct > 0 else 0.0
-        return (is_smart, is_triple, x.total_score, baseline_bonus)
-
+    # Dedup — giữ bản điểm cao nhất cho mỗi symbol
     seen: dict[str, ScoreResult] = {}
-    for r in sorted(all_results, key=_intraday_rank_key, reverse=True):
+    for r in sorted(all_results, key=lambda x: x.total_score, reverse=True):
         base = r.symbol.upper().rstrip("M") if r.symbol.upper().endswith("USDTM") else r.symbol.upper()
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
     log.info(f"⚡ Intraday scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
     return final[:INTRADAY_TOP_N]
 
@@ -3840,7 +3804,7 @@ def run_intraday_early_scan() -> list[ScoreResult]:
 def format_intraday_alert(results: list[ScoreResult]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"⚡ <b>INTRADAY EARLY PUMP — {now}</b>\n"]
-    lines.append("🔔 <i>Chỉ lọc INTRADAY EARLY PUMP — alert trước khi nến D đóng</i>\n")
+    lines.append("🔔 <i>Chỉ INTRADAY PUMP: OI Delta baseline + %OI tăng + CVD Fut/Spot cùng rising</i>\n")
 
     def fmt_price(v: float) -> str:
         return f"{v:.6g}" if v > 0 else "-"
@@ -3878,12 +3842,6 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
         cvd_line = " | ".join(cvd_status) if cvd_status else ""
 
         lines.append(f"{'═'*30}")
-        price_line = f"💰 Giá hiện tại: <b>{fmt_price(r.price_current)}</b>"
-        if r.entry_zone_low > 0 and r.entry_zone_high > 0:
-            buy_zone_line = f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>"
-        else:
-            buy_zone_line = ""
-
         lines.append(
             f"{rank} <b>{sym}</b> — <b>{r.total_score:.1f}đ</b>\n"
             f"⚡ <b>{sig}</b>\n"
@@ -3891,9 +3849,15 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
             f"{oi_line}"
             + (f"\n{cvd_line}" if cvd_line else "") +
             f"\nFR: <b>{r.fr:.4f}%</b>"
-            f"\n{price_line}"
-            + (f"\n{buy_zone_line}" if buy_zone_line else "")
         )
+        if r.entry > 0 and r.tp1 > 0:
+            lines.append(
+                f"🎯 Buy Zone: <b>{fmt_price(r.entry_zone_low)} → {fmt_price(r.entry_zone_high)}</b>\n"
+                f"📍 Entry chuẩn: <b>{fmt_price(r.entry)}</b> | SL: <b>{fmt_price(r.sl)}</b>\n"
+                f"🎯 TP1: <b>{fmt_price(r.tp1)}</b> ({pct(r.tp1, r.entry)})\n"
+                f"🎯 TP2: <b>{fmt_price(r.tp2)}</b> ({pct(r.tp2, r.entry)})\n"
+                f"🎯 TP3: <b>{fmt_price(r.tp3)}</b> ({pct(r.tp3, r.entry)})"
+            )
         if r.entry_note:
             lines.append(f"🧠 <i>{html.escape(r.entry_note)}</i>")
         lines.append("")
@@ -3903,7 +3867,7 @@ def format_intraday_alert(results: list[ScoreResult]) -> str:
 
 
 def job_intraday_scan():
-    """Chạy mỗi 30 phút (xx:02 / xx:32 UTC) — chỉ scan và alert INTRADAY EARLY PUMP."""
+    """Chạy mỗi 30 phút (xx:17 / xx:47 UTC) — scan intraday early pump + H1 spike + quiet accum."""
     try:
         results = run_intraday_early_scan()
         if not results:
@@ -3965,7 +3929,7 @@ def run_h1_spike_scan() -> list[ScoreResult]:
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
     log.info(f"⚡ H1 spike scan xong {time.time()-scan_start:.1f}s | {len(final)} unique")
     return final[:INTRADAY_TOP_N]
 
@@ -5369,7 +5333,7 @@ def run_h2_scan() -> list[ScoreResult]:
         if base not in seen:
             seen[base] = r
 
-    final = sorted(seen.values(), key=_intraday_rank_key, reverse=True)
+    final = sorted(seen.values(), key=lambda x: x.total_score, reverse=True)
     log.info(f"🕐 H2 scan xong {time.time()-scan_start:.1f}s | {len(final)} unique signals")
     return final[:H2_SCAN_TOP_N]
 
@@ -5554,8 +5518,8 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "--now":
-        log.info("🧪 Chạy Intraday Early Pump scan ngay và gửi Telegram nếu có signal...")
-        job_intraday_scan()
+        log.info("🧪 Chạy test ngay...")
+        job()
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-one":
         if len(sys.argv) < 3:
@@ -5585,40 +5549,36 @@ if __name__ == "__main__":
             print(f"❌ Không lấy được data cho {symbol} · {exchange}")
 
     else:
-        # ── SCHEDULER V7.2 FIXED ─────────────────────────────────
-        # xx:02 UTC → Full scan mỗi giờ: PUMP + DUMP + REVERSAL
-        # xx:02 / xx:32 UTC → Intraday Early Pump scan
-        # Fix: KHÔNG dùng next_hourly_slot_utc() trong loop vì dễ miss xx:02 nếu bot thức dậy sau vài giây.
-        # Logic mới check theo phút hiện tại, chạy đúng 1 lần mỗi slot.
-
-        FULL_SCAN_MINUTE = 2
-        MONITOR_MINUTES = (2, 32)
+        # ── SCHEDULER V8.1 — ONLY INTRADAY PUMP, EVERY 2 HOURS ──
+        # Chỉ quét và gửi Telegram mục INTRADAY PUMP.
+        # Bỏ Full 1D, H1 Vol Spike, H2 Gem, Reversal, Dump và các alert phụ khác.
+        INTRADAY_SCAN_MINUTE = 2       # chạy tại xx:02 UTC
+        INTRADAY_SCAN_EVERY_HOURS = 2  # mỗi 2 giờ
         CHECK_SLEEP = 10
 
         def slot_id(dt):
             return dt.strftime("%Y%m%d%H%M")
 
-        log.info("⏰ SCHEDULER V7.5 FIXED khởi động")
-        log.info("   xx:02 / xx:32 UTC → Intraday Early Pump scan → Telegram")
-        log.info("   --now → chạy Intraday Early Pump scan ngay")
+        log.info("⏰ SCHEDULER V8.1 khởi động")
+        log.info("   xx:02 UTC mỗi 2 giờ → ONLY INTRADAY PUMP → Telegram")
+        log.info("   Điều kiện: TRIPLE CONFIRMED + BASELINE EARLY")
+        log.info("   OI Delta baseline mạnh + %OI tăng + CVD Fut ↑ + CVD Spot ↑")
         log.info(f"   Sàn quét: {' | '.join(SCAN_EXCHANGES)}")
 
-        last_full_slot    = ""
-        last_monitor_slot = ""
-        last_h2_slot      = ""
+        last_intraday_slot = ""
 
         while True:
             now = datetime.now(timezone.utc)
             current_slot = slot_id(now)
 
-            # ĐÃ TẮT: Full 1D / H1 Spike / H2 Gem Telegram
-            # Bot chỉ gửi Telegram khi có INTRADAY EARLY PUMP tại xx:02 / xx:32 UTC.
-
-            # Intraday early scan — chạy tại xx:02 và xx:32 UTC
-            if now.minute in MONITOR_MINUTES and current_slot != last_monitor_slot:
-                last_monitor_slot = current_slot
+            if (
+                now.minute == INTRADAY_SCAN_MINUTE
+                and now.hour % INTRADAY_SCAN_EVERY_HOURS == 0
+                and current_slot != last_intraday_slot
+            ):
+                last_intraday_slot = current_slot
                 try:
-                    log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] Intraday early scan...")
+                    log.info(f"⚡ [{now.strftime('%H:%M:%S UTC')}] ONLY Intraday Pump scan...")
                     job_intraday_scan()
                 except Exception as e:
                     log.error(f"Intraday scheduler error: {e}", exc_info=True)
@@ -5627,14 +5587,17 @@ if __name__ == "__main__":
                     except Exception:
                         pass
 
-            # Log nhẹ để biết bot còn sống, không spam mỗi 10s quá nhiều
             if now.second < CHECK_SLEEP:
-                next_full_h = now.hour if now.minute < FULL_SCAN_MINUTE else (now.hour + 1) % 24
+                next_hour = now.hour if (now.hour % INTRADAY_SCAN_EVERY_HOURS == 0 and now.minute < INTRADAY_SCAN_MINUTE) else now.hour + 1
+                while next_hour % INTRADAY_SCAN_EVERY_HOURS != 0:
+                    next_hour += 1
+                next_hour %= 24
                 log.info(
-                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Intraday Early Pump: xx:02 / xx:32 UTC"
+                    f"⏳ Alive {now.strftime('%H:%M:%S UTC')} | Next Intraday Pump: "
+                    f"{next_hour:02d}:{INTRADAY_SCAN_MINUTE:02d} UTC"
                 )
 
-            # Poll Telegram commands
+            # Vẫn poll command Telegram nếu có dùng lệnh điều khiển bot.
             try:
                 _poll_telegram_commands()
             except Exception as e:
