@@ -3778,6 +3778,16 @@ def score_quiet_accumulation(coin: CoinData) -> Optional["ScoreResult"]:
     return result
 
 
+def _intraday_rank_key(x: ScoreResult):
+    """Hàm sort dùng chung cho intraday / h1-spike / h2 scan.
+    Ưu tiên: SMART MONEY > TRIPLE CONFIRMED > total_score > baseline sớm."""
+    text = (x.signal_type + " " + " ".join(x.details)).upper()
+    is_triple = 1 if "TRIPLE" in text else 0
+    is_smart  = 1 if "SMART MONEY" in text or "BASELINE EARLY" in text else 0
+    baseline_bonus = max(0.0, SMART_BASELINE_EARLY - x.baseline_break_pct) if x.baseline_break_pct > 0 else 0.0
+    return (is_smart, is_triple, x.total_score, baseline_bonus)
+
+
 def run_intraday_early_scan() -> list[ScoreResult]:
     """
     Quét intraday early detection song song 2 sàn.
@@ -3819,13 +3829,6 @@ def run_intraday_early_scan() -> list[ScoreResult]:
                 log.error(f"Intraday scan error: {e}")
 
     # Dedup — giữ bản điểm cao nhất cho mỗi symbol, ưu tiên TRIPLE CONFIRMED + mới thoát baseline.
-    def _intraday_rank_key(x: ScoreResult):
-        text = (x.signal_type + " " + " ".join(x.details)).upper()
-        is_triple = 1 if "TRIPLE" in text else 0
-        is_smart  = 1 if "SMART MONEY" in text or "BASELINE EARLY" in text else 0
-        baseline_bonus = max(0.0, SMART_BASELINE_EARLY - x.baseline_break_pct) if x.baseline_break_pct > 0 else 0.0
-        return (is_smart, is_triple, x.total_score, baseline_bonus)
-
     seen: dict[str, ScoreResult] = {}
     for r in sorted(all_results, key=_intraday_rank_key, reverse=True):
         base = r.symbol.upper().rstrip("M") if r.symbol.upper().endswith("USDTM") else r.symbol.upper()
